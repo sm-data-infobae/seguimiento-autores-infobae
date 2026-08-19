@@ -8,9 +8,21 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+# Contexto de ejecución de Streamlit. Hay que propagarlo a los hilos que lanzan
+# queries: sin él, los st.error() que emiten las funciones de carga se pierden.
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except ImportError:  # versiones antiguas de Streamlit
+    add_script_run_ctx = None
+
+    def get_script_run_ctx():
+        return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN GLOBAL
@@ -92,67 +104,45 @@ def get_bigquery_client():
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# QUERIES OPTIMIZADAS - LÓGICA DUAL DE FECHAS
+# EJECUCIÓN EN PARALELO
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_user_notes_cte(email_filter: str, start_date: str, end_date: str, include_urls: bool = False) -> str:
+def run_parallel(tasks: dict, max_workers: int = 8) -> dict:
     """
-    Genera las CTEs para identificar las notas "del usuario".
-    Un usuario es dueño de una nota si:
-    1. La CREÓ (evento CREATE)
-    2. La PUBLICÓ (evento FIRST_PUBLISH)
-    3. Fue el PRIMERO en hacer SAVE (si no hay CREATE de nadie)
-    
-    Returns: String con las CTEs (sin WITH inicial, para poder encadenar)
-    """
-    url_field = ", story_url" if include_urls else ""
-    url_select = f", e.story_url" if include_urls else ""
-    url_ps_select = f", ps.story_url" if include_urls else ""
-    
-    return f"""
-        notas_create_{email_filter.replace('@', '_').replace('.', '_')[:10]} AS (
-            SELECT DISTINCT note_id{url_select} FROM `{TABLE_EDITORIAL}` e
-            WHERE email_editor = '{email_filter}'
-              AND action_type = 'CREATE'
-              AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
-              {"AND story_url IS NOT NULL" if include_urls else ""}
-        ),
-        notas_publish_{email_filter.replace('@', '_').replace('.', '_')[:10]} AS (
-            SELECT DISTINCT note_id{url_select} FROM `{TABLE_EDITORIAL}` e
-            WHERE email_editor = '{email_filter}'
-              AND action_type = 'FIRST_PUBLISH'
-              AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
-              {"AND story_url IS NOT NULL" if include_urls else ""}
-        ),
-        primer_save_{email_filter.replace('@', '_').replace('.', '_')[:10]} AS (
-            SELECT note_id, email_editor{", story_url" if include_urls else ""},
-                   ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY event_timestamp) as rn
-            FROM `{TABLE_EDITORIAL}`
-            WHERE action_type = 'SAVE'
-              AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
-              {"AND story_url IS NOT NULL" if include_urls else ""}
-        ),
-        notas_con_create AS (
-            SELECT DISTINCT note_id FROM `{TABLE_EDITORIAL}` WHERE action_type = 'CREATE'
-        ),
-        notas_primer_save_{email_filter.replace('@', '_').replace('.', '_')[:10]} AS (
-            SELECT ps.note_id{url_ps_select} FROM primer_save_{email_filter.replace('@', '_').replace('.', '_')[:10]} ps
-            WHERE ps.rn = 1 
-              AND ps.email_editor = '{email_filter}'
-              AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
-        ),
-        todas_notas_usuario AS (
-            SELECT note_id{url_field} FROM notas_create_{email_filter.replace('@', '_').replace('.', '_')[:10]} UNION DISTINCT
-            SELECT note_id{url_field} FROM notas_publish_{email_filter.replace('@', '_').replace('.', '_')[:10]} UNION DISTINCT
-            SELECT note_id{url_field} FROM notas_primer_save_{email_filter.replace('@', '_').replace('.', '_')[:10]}
-        ),
-        notas_publicadas_periodo AS (
-            SELECT DISTINCT note_id FROM `{TABLE_EDITORIAL}`
-            WHERE action_type = 'FIRST_PUBLISH'
-              AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
-        )
-    """
+    Ejecuta un dict {nombre: callable} en paralelo y devuelve {nombre: resultado}.
 
+    Las queries del tablero son independientes entre sí, así que el tiempo total
+    pasa a ser el de la más lenta en vez de la suma de todas. Cada callable se
+    encarga de su propio manejo de errores (igual que cuando corrían en serie);
+    si una excepción escapa, se propaga al hilo principal como antes.
+    """
+    if not tasks:
+        return {}
+
+    ctx = get_script_run_ctx()
+
+    def with_ctx(fn):
+        def runner():
+            if add_script_run_ctx is not None:
+                add_script_run_ctx(threading.current_thread(), ctx)
+            return fn()
+        return runner
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
+        futures = {name: pool.submit(with_ctx(fn)) for name, fn in tasks.items()}
+        return {name: future.result() for name, future in futures.items()}
+
+
+# st.fragment permite que un cambio de selectbox re-ejecute sólo ese bloque en
+# vez de todo el script. Se degrada a no-op en versiones que no lo tengan.
+_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+if _fragment is None:
+    def _fragment(func):
+        return func
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUERIES OPTIMIZADAS - LÓGICA DUAL DE FECHAS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_production_metrics(_client, start_date: str, end_date: str, email_filter: str = None, seccion_filter: str = None, pais_filter: str = None) -> dict:
@@ -176,7 +166,8 @@ def load_production_metrics(_client, start_date: str, end_date: str, email_filte
     creadores = 0
     publicadores = 0
     notas = 0
-    
+    tasks = {}
+
     if email_filter:
         # Query para contar creadores y publicadores de las notas del usuario
         query_counts = f"""
@@ -248,14 +239,18 @@ def load_production_metrics(_client, start_date: str, end_date: str, email_filte
                 (SELECT COUNT(*) FROM publicadores_notas) as total_publicadores
         """
         
-        try:
-            df_counts = _client.query(query_counts).to_dataframe()
-            if not df_counts.empty:
-                creadores = int(df_counts.iloc[0]['total_creadores'] or 0)
-                publicadores = int(df_counts.iloc[0]['total_publicadores'] or 0)
-        except:
-            pass
-        
+        def fetch_counts():
+            try:
+                df_counts = _client.query(query_counts).to_dataframe()
+                if not df_counts.empty:
+                    return (int(df_counts.iloc[0]['total_creadores'] or 0),
+                            int(df_counts.iloc[0]['total_publicadores'] or 0))
+            except:
+                pass
+            return None
+
+        tasks['counts'] = fetch_counts
+
         # Query para notas publicadas del usuario
         query_notas = f"""
             WITH notas_create AS (
@@ -330,27 +325,49 @@ def load_production_metrics(_client, start_date: str, end_date: str, email_filte
               {seccion_clause} {pais_clause}
         """
         
+        def fetch_creadores():
+            try:
+                df_creadores = _client.query(query_creadores).to_dataframe()
+                if not df_creadores.empty:
+                    return int(df_creadores.iloc[0]['creadores_activos'] or 0)
+            except Exception as e:
+                st.error(f"Error cargando creadores activos: {e}")
+            return 0
+
+        def fetch_publicadores():
+            try:
+                df_publicadores = _client.query(query_publicadores).to_dataframe()
+                if not df_publicadores.empty:
+                    return int(df_publicadores.iloc[0]['publicadores_activos'] or 0)
+            except Exception as e:
+                st.error(f"Error cargando publicadores activos: {e}")
+            return 0
+
+        tasks['creadores'] = fetch_creadores
+        tasks['publicadores'] = fetch_publicadores
+
+    def fetch_notas():
         try:
-            df_creadores = _client.query(query_creadores).to_dataframe()
-            if not df_creadores.empty:
-                creadores = int(df_creadores.iloc[0]['creadores_activos'] or 0)
+            df_notas = _client.query(query_notas).to_dataframe()
+            if not df_notas.empty:
+                return int(df_notas.iloc[0]['notas_publicadas'] or 0)
         except Exception as e:
-            st.error(f"Error cargando creadores activos: {e}")
-        
-        try:
-            df_publicadores = _client.query(query_publicadores).to_dataframe()
-            if not df_publicadores.empty:
-                publicadores = int(df_publicadores.iloc[0]['publicadores_activos'] or 0)
-        except Exception as e:
-            st.error(f"Error cargando publicadores activos: {e}")
-    
-    try:
-        df_notas = _client.query(query_notas).to_dataframe()
-        if not df_notas.empty:
-            notas = int(df_notas.iloc[0]['notas_publicadas'] or 0)
-    except Exception as e:
-        st.error(f"Error cargando notas publicadas: {e}")
-    
+            st.error(f"Error cargando notas publicadas: {e}")
+        return 0
+
+    tasks['notas'] = fetch_notas
+
+    # Las queries de este bloque son independientes: se lanzan juntas.
+    results = run_parallel(tasks)
+
+    if 'counts' in results and results['counts'] is not None:
+        creadores, publicadores = results['counts']
+    if 'creadores' in results:
+        creadores = results['creadores']
+    if 'publicadores' in results:
+        publicadores = results['publicadores']
+    notas = results['notas']
+
     return {'creadores_activos': creadores, 'publicadores_activos': publicadores, 'notas_publicadas': notas}
 
 
@@ -505,25 +522,37 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
               {seccion_clause} {pais_clause}
         """
     
-    try:
-        df = _client.query(query).to_dataframe()
-        if not df.empty:
-            row = df.iloc[0]
-            result['visitas_totales'] = int(row['visitas_totales']) if pd.notna(row['visitas_totales']) else 0
-            result['pageviews_totales'] = int(row['pageviews_totales']) if pd.notna(row['pageviews_totales']) else 0
-            result['tiempo_promedio_min'] = (float(row['tiempo_promedio_segundos']) if pd.notna(row['tiempo_promedio_segundos']) else 0) / 60
-            result['scroll_promedio'] = float(row['scroll_promedio']) if pd.notna(row['scroll_promedio']) else 0
-            result['scrolls_totales'] = int(row['scrolls_totales']) if pd.notna(row['scrolls_totales']) else 0
-    except Exception as e:
-        st.error(f"Error cargando métricas de tráfico: {e}")
-    
-    try:
-        df_users = _client.query(query_users).to_dataframe()
-        if not df_users.empty:
-            result['usuarios_unicos'] = int(df_users.iloc[0]['usuarios_unicos']) if pd.notna(df_users.iloc[0]['usuarios_unicos']) else 0
-    except:
-        pass
-    
+    def fetch_trafico():
+        parcial = {}
+        try:
+            df = _client.query(query).to_dataframe()
+            if not df.empty:
+                row = df.iloc[0]
+                parcial['visitas_totales'] = int(row['visitas_totales']) if pd.notna(row['visitas_totales']) else 0
+                parcial['pageviews_totales'] = int(row['pageviews_totales']) if pd.notna(row['pageviews_totales']) else 0
+                parcial['tiempo_promedio_min'] = (float(row['tiempo_promedio_segundos']) if pd.notna(row['tiempo_promedio_segundos']) else 0) / 60
+                parcial['scroll_promedio'] = float(row['scroll_promedio']) if pd.notna(row['scroll_promedio']) else 0
+                parcial['scrolls_totales'] = int(row['scrolls_totales']) if pd.notna(row['scrolls_totales']) else 0
+        except Exception as e:
+            st.error(f"Error cargando métricas de tráfico: {e}")
+        return parcial
+
+    def fetch_usuarios():
+        try:
+            df_users = _client.query(query_users).to_dataframe()
+            if not df_users.empty:
+                return int(df_users.iloc[0]['usuarios_unicos']) if pd.notna(df_users.iloc[0]['usuarios_unicos']) else 0
+        except:
+            pass
+        return None
+
+    # Las dos queries son independientes: se lanzan juntas.
+    results = run_parallel({'trafico': fetch_trafico, 'usuarios': fetch_usuarios})
+
+    result.update(results['trafico'])
+    if results['usuarios'] is not None:
+        result['usuarios_unicos'] = results['usuarios']
+
     return result
 
 
@@ -532,12 +561,15 @@ def load_kpis(_client, start_date: str, end_date: str, email_filter: str = None,
     """
     Combina métricas de producción (arc_editorial_activity) y tráfico (GA4).
     """
-    # Cargar métricas de producción desde arc_editorial_activity
-    production = load_production_metrics(_client, start_date, end_date, email_filter, seccion_filter, pais_filter)
-    
-    # Cargar métricas de tráfico desde GA4
-    traffic = load_traffic_metrics(_client, start_date, end_date, email_filter, seccion_filter, pais_filter)
-    
+    # Producción (arc_editorial_activity) y tráfico (GA4) no dependen entre sí:
+    # se cargan en paralelo.
+    bloques = run_parallel({
+        'production': lambda: load_production_metrics(_client, start_date, end_date, email_filter, seccion_filter, pais_filter),
+        'traffic': lambda: load_traffic_metrics(_client, start_date, end_date, email_filter, seccion_filter, pais_filter),
+    })
+    production = bloques['production']
+    traffic = bloques['traffic']
+
     # Calcular productividad
     notas = production['notas_publicadas']
     visitas = traffic['visitas_totales']
@@ -1171,11 +1203,10 @@ def load_geo_data(_client, start_date: str, end_date: str, email_filter: str = N
                   AND e.story_url IS NOT NULL AND e.story_url != ''
                   {note_filter} {seccion_clause} {pais_clause}
             )
-            SELECT 
+            SELECT
                 g.dimension_type,
                 g.dimension_value,
-                SUM(g.visits) as total_visits,
-                COUNT(DISTINCT g.article_url) as article_count
+                SUM(g.visits) as total_visits
             FROM `{TABLE_GEO_SOURCES}` g
             INNER JOIN urls_filtradas u ON g.article_url = u.story_url
             WHERE g.event_date BETWEEN '{start_date}' AND '{end_date}'
@@ -1186,11 +1217,10 @@ def load_geo_data(_client, start_date: str, end_date: str, email_filter: str = N
         """
     else:
         query = f"""
-            SELECT 
+            SELECT
                 dimension_type,
                 dimension_value,
-                SUM(visits) as total_visits,
-                COUNT(DISTINCT article_url) as article_count
+                SUM(visits) as total_visits
             FROM `{TABLE_GEO_SOURCES}`
             WHERE event_date BETWEEN '{start_date}' AND '{end_date}'
             GROUP BY dimension_type, dimension_value
@@ -1395,23 +1425,38 @@ def get_last_data_date(_client) -> tuple:
     """
     Obtiene la última fecha con datos disponibles en la tabla Gold.
     Retorna (fecha_formateada, objeto_date) o (None, None) si no hay datos.
+
+    Primero pregunta al catálogo de particiones (metadata: no escanea la tabla).
+    Si la service account no tiene permiso sobre INFORMATION_SCHEMA, cae al
+    MAX(date) de siempre, que da el mismo resultado escaneando la columna entera.
     """
-    query = f"""
+    proyecto, dataset, tabla = TABLE_PRODUCTIVITY.split('.')
+
+    query_particiones = f"""
+        SELECT MAX(PARSE_DATE('%Y%m%d', partition_id)) as ultima_fecha
+        FROM `{proyecto}.{dataset}.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = '{tabla}'
+          AND partition_id != '__NULL__'
+          AND total_rows > 0
+    """
+    query_fallback = f"""
         SELECT MAX(date) as ultima_fecha
         FROM `{TABLE_PRODUCTIVITY}`
     """
-    try:
-        df = _client.query(query).to_dataframe()
-        if not df.empty and df.iloc[0]['ultima_fecha'] is not None:
-            fecha = df.iloc[0]['ultima_fecha']
-            # Convertir a date si es datetime
-            if hasattr(fecha, 'date'):
-                fecha_date = fecha.date()
-            else:
-                fecha_date = fecha
-            return (fecha_date.strftime('%d/%m/%Y'), fecha_date)
-    except:
-        pass
+
+    for query in (query_particiones, query_fallback):
+        try:
+            df = _client.query(query).to_dataframe()
+            if not df.empty and df.iloc[0]['ultima_fecha'] is not None:
+                fecha = df.iloc[0]['ultima_fecha']
+                # Convertir a date si es datetime
+                if hasattr(fecha, 'date'):
+                    fecha_date = fecha.date()
+                else:
+                    fecha_date = fecha
+                return (fecha_date.strftime('%d/%m/%Y'), fecha_date)
+        except:
+            continue
     return (None, None)
 
 
@@ -1457,33 +1502,47 @@ def load_filter_options(_client, start_date: str, end_date: str) -> dict:
         ORDER BY a.country
     """
     
-    try:
-        df_emails = _client.query(query_emails).to_dataframe()
-        # Crear diccionario {display_name: email} para el dropdown
-        email_options = {}
-        for _, row in df_emails.iterrows():
-            email = row['email_editor']
-            display = row['display_name']
-            if email and display:
-                email_options[display] = email
-        # Ordenar por nombre
-        email_options = dict(sorted(email_options.items()))
-    except:
-        email_options = {}
-    
-    try:
-        df_secciones = _client.query(query_secciones).to_dataframe()
-        secciones = sorted([s for s in df_secciones['segment'].dropna().unique() if s.strip()])
-    except:
-        secciones = []
-    
-    try:
-        df_paises = _client.query(query_paises).to_dataframe()
-        paises = sorted([p for p in df_paises['country'].dropna().unique() if p.strip()])
-    except:
-        paises = []
-    
-    return {'email_options': email_options, 'secciones': secciones, 'paises': paises}
+    def fetch_emails():
+        try:
+            df_emails = _client.query(query_emails).to_dataframe()
+            # Crear diccionario {display_name: email} para el dropdown
+            email_options = {}
+            for _, row in df_emails.iterrows():
+                email = row['email_editor']
+                display = row['display_name']
+                if email and display:
+                    email_options[display] = email
+            # Ordenar por nombre
+            return dict(sorted(email_options.items()))
+        except:
+            return {}
+
+    def fetch_secciones():
+        try:
+            df_secciones = _client.query(query_secciones).to_dataframe()
+            return sorted([s for s in df_secciones['segment'].dropna().unique() if s.strip()])
+        except:
+            return []
+
+    def fetch_paises():
+        try:
+            df_paises = _client.query(query_paises).to_dataframe()
+            return sorted([p for p in df_paises['country'].dropna().unique() if p.strip()])
+        except:
+            return []
+
+    # Las tres queries son independientes: se lanzan juntas.
+    results = run_parallel({
+        'email_options': fetch_emails,
+        'secciones': fetch_secciones,
+        'paises': fetch_paises,
+    })
+
+    return {
+        'email_options': results['email_options'],
+        'secciones': results['secciones'],
+        'paises': results['paises'],
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1989,6 +2048,7 @@ def render_kpis(kpis: dict, prev_kpis: dict):
         """)
 
 
+@_fragment
 def render_impact_zone(top_publishers: pd.DataFrame, top_creators: pd.DataFrame, geo_df: pd.DataFrame):
     """Renderiza la Zona de Impacto: Top Publicadores, Top Creadores y Datos geográficos."""
     
@@ -2101,6 +2161,7 @@ def render_impact_zone(top_publishers: pd.DataFrame, top_creators: pd.DataFrame,
         st.info("Datos geográficos no disponibles")
 
 
+@_fragment
 def render_temporal_zone(client, start_date: str, end_date: str, email_filter: str = None, seccion_filter: str = None, pais_filter: str = None):
     """Renderiza la Zona Temporal con línea de tendencia."""
     
@@ -2350,6 +2411,7 @@ def render_source_efficiency(source_stats: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
 
 
+@_fragment
 def render_author_scatter(_client, start_date: str, end_date: str, email_filter: str = None, seccion_filter: str = None, pais_filter: str = None):
     """Renderiza el scatter plot de productividad por autor con selector de métrica."""
     
@@ -2711,18 +2773,30 @@ def main():
     seccion_filter = selected_section if selected_section != "Todas" else None
     pais_filter = selected_pais if selected_pais != "Todos" else None
     
-    # Cargar datos optimizados (con filtros aplicados)
+    # Cargar datos optimizados (con filtros aplicados).
+    # Ninguno de estos bloques depende del resultado de otro, así que se lanzan
+    # todos juntos: el tiempo total pasa a ser el de la query más lenta.
     with st.spinner("🔄 Cargando datos..."):
-        kpis = load_kpis(client, start_str, end_str, email_filter, seccion_filter, pais_filter)
-        prev_kpis = load_previous_kpis(client, start_str, end_str, email_filter, seccion_filter, pais_filter)
-        top_publishers = load_top_publishers(client, start_str, end_str, 10, email_filter, seccion_filter, pais_filter)
-        top_creators = load_top_creators(client, start_str, end_str, 10, email_filter, seccion_filter, pais_filter)
-        geo_df = load_geo_data(client, start_str, end_str, email_filter, seccion_filter, pais_filter)
-        section_stats = load_section_stats(client, start_str, end_str, email_filter, seccion_filter, pais_filter)
-        top_articles = load_top_articles(client, start_str, end_str, 100, email_filter, seccion_filter, pais_filter)
-        # Nuevas métricas de análisis
-        source_efficiency = load_source_efficiency(client, start_str, end_str, email_filter, seccion_filter, pais_filter)
-    
+        datos = run_parallel({
+            'kpis': lambda: load_kpis(client, start_str, end_str, email_filter, seccion_filter, pais_filter),
+            'prev_kpis': lambda: load_previous_kpis(client, start_str, end_str, email_filter, seccion_filter, pais_filter),
+            'top_publishers': lambda: load_top_publishers(client, start_str, end_str, 10, email_filter, seccion_filter, pais_filter),
+            'top_creators': lambda: load_top_creators(client, start_str, end_str, 10, email_filter, seccion_filter, pais_filter),
+            'geo_df': lambda: load_geo_data(client, start_str, end_str, email_filter, seccion_filter, pais_filter),
+            'section_stats': lambda: load_section_stats(client, start_str, end_str, email_filter, seccion_filter, pais_filter),
+            'top_articles': lambda: load_top_articles(client, start_str, end_str, 100, email_filter, seccion_filter, pais_filter),
+            # Nuevas métricas de análisis
+            'source_efficiency': lambda: load_source_efficiency(client, start_str, end_str, email_filter, seccion_filter, pais_filter),
+        })
+        kpis = datos['kpis']
+        prev_kpis = datos['prev_kpis']
+        top_publishers = datos['top_publishers']
+        top_creators = datos['top_creators']
+        geo_df = datos['geo_df']
+        section_stats = datos['section_stats']
+        top_articles = datos['top_articles']
+        source_efficiency = datos['source_efficiency']
+
     # Renderizar dashboard
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     render_kpis(kpis, prev_kpis)
