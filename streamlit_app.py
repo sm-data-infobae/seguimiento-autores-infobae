@@ -133,6 +133,17 @@ def run_parallel(tasks: dict, max_workers: int = 8) -> dict:
         return {name: future.result() for name, future in futures.items()}
 
 
+def sql_safe(valor):
+    """
+    Escapa un valor que va interpolado dentro de comillas simples en SQL.
+    Los filtros vienen de dropdowns (valores que ya existen en las tablas),
+    pero un apellido con apóstrofo -- O'Higgins -- rompería la query igual.
+    """
+    if valor is None:
+        return None
+    return valor.replace("\\", "\\\\").replace("'", "\\'")
+
+
 # st.fragment permite que un cambio de selectbox re-ejecute sólo ese bloque en
 # vez de todo el script. Se degrada a no-op en versiones que no lo tengan.
 _fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
@@ -197,7 +208,7 @@ def load_production_metrics(_client, start_date: str, end_date: str, email_filte
                 SELECT ps.note_id FROM primer_save ps
                 WHERE ps.rn = 1 
                   AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id FROM notas_create UNION DISTINCT
@@ -214,7 +225,7 @@ def load_production_metrics(_client, start_date: str, end_date: str, email_filte
             ),
             creadores_primer_save AS (
                 SELECT ps.note_id, ps.email_editor as creador_email FROM primer_save_all ps
-                WHERE ps.rn = 1 AND ps.note_id NOT IN (SELECT note_id FROM creadores_create)
+                WHERE ps.rn = 1 AND NOT EXISTS (SELECT 1 FROM creadores_create cc WHERE cc.note_id = ps.note_id)
             ),
             creadores_reales AS (
                 SELECT note_id, creador_email FROM creadores_create UNION ALL
@@ -279,7 +290,7 @@ def load_production_metrics(_client, start_date: str, end_date: str, email_filte
                 SELECT ps.note_id FROM primer_save ps
                 WHERE ps.rn = 1 
                   AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id FROM notas_create UNION DISTINCT
@@ -425,7 +436,7 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
                 SELECT ps.note_id, ps.story_url FROM primer_save ps
                 WHERE ps.rn = 1 
                   AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id, story_url FROM notas_create UNION DISTINCT
@@ -476,7 +487,7 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
             notas_primer_save AS (
                 SELECT ps.note_id, ps.story_url FROM primer_save ps
                 WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id, story_url FROM notas_create UNION DISTINCT
@@ -644,7 +655,7 @@ def load_top_publishers(_client, start_date: str, end_date: str, limit: int = 10
                 SELECT ps.note_id FROM primer_save ps
                 WHERE ps.rn = 1 
                   AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id FROM notas_create UNION DISTINCT
@@ -677,7 +688,9 @@ def load_top_publishers(_client, start_date: str, end_date: str, limit: int = 10
                     ELSE COALESCE(a.complete_name, e.email_editor) 
                 END as Publicador,
                 a.country as Pais,
-                COUNT(*) as notas_publicadas
+                -- DISTINCT note_id: hay eventos FIRST_PUBLISH duplicados por nota
+                -- (medido: 15.229 eventos vs 14.035 notas en una semana)
+                COUNT(DISTINCT e.note_id) as notas_publicadas
             FROM `{TABLE_EDITORIAL}` e
             LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)
             WHERE e.action_type = 'FIRST_PUBLISH'
@@ -734,7 +747,7 @@ def load_top_creators(_client, start_date: str, end_date: str, limit: int = 10, 
                 SELECT ps.note_id FROM primer_save ps
                 WHERE ps.rn = 1 
                   AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id FROM notas_create UNION DISTINCT
@@ -754,7 +767,7 @@ def load_top_creators(_client, start_date: str, end_date: str, limit: int = 10, 
             creadores_primer_save AS (
                 SELECT ps.note_id, ps.email_editor as creador_email
                 FROM primer_save_all ps
-                WHERE ps.rn = 1 AND ps.note_id NOT IN (SELECT note_id FROM creadores_create)
+                WHERE ps.rn = 1 AND NOT EXISTS (SELECT 1 FROM creadores_create cc WHERE cc.note_id = ps.note_id)
             ),
             creadores_reales AS (
                 SELECT note_id, creador_email FROM creadores_create
@@ -786,7 +799,8 @@ def load_top_creators(_client, start_date: str, end_date: str, limit: int = 10, 
                     ELSE COALESCE(a.complete_name, e.email_editor) 
                 END as Creador,
                 a.country as Pais,
-                COUNT(*) as notas_creadas
+                -- DISTINCT note_id: puede haber eventos CREATE duplicados por nota
+                COUNT(DISTINCT e.note_id) as notas_creadas
             FROM `{TABLE_EDITORIAL}` e
             LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)
             WHERE e.action_type = 'CREATE'
@@ -837,7 +851,7 @@ def load_daily_evolution(_client, start_date: str, end_date: str, metric: str = 
                 notas_primer_save AS (
                     SELECT ps.note_id FROM primer_save ps
                     WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                      AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                      AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
                 ),
                 todas_notas_usuario AS (
                     SELECT note_id FROM notas_create UNION DISTINCT
@@ -854,7 +868,7 @@ def load_daily_evolution(_client, start_date: str, end_date: str, metric: str = 
             """
         else:
             query = f"""
-                SELECT DATE(e.event_timestamp) as fecha, COUNT(*) as valor
+                SELECT DATE(e.event_timestamp) as fecha, COUNT(DISTINCT e.note_id) as valor
                 FROM `{TABLE_EDITORIAL}` e {join_clause}
                 WHERE e.action_type = 'FIRST_PUBLISH'
                   AND DATE(e.event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
@@ -883,7 +897,7 @@ def load_daily_evolution(_client, start_date: str, end_date: str, metric: str = 
                 notas_primer_save AS (
                     SELECT ps.note_id, ps.story_url FROM primer_save ps
                     WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                      AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                      AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
                 ),
                 todas_notas_usuario AS (
                     SELECT note_id, story_url FROM notas_create UNION DISTINCT
@@ -938,7 +952,7 @@ def load_daily_evolution(_client, start_date: str, end_date: str, metric: str = 
                 notas_primer_save AS (
                     SELECT ps.note_id, ps.story_url FROM primer_save ps
                     WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                      AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                      AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
                 ),
                 todas_notas_usuario AS (
                     SELECT note_id, story_url FROM notas_create UNION DISTINCT
@@ -1014,7 +1028,7 @@ def load_section_stats(_client, start_date: str, end_date: str, email_filter: st
             notas_primer_save AS (
                 SELECT ps.note_id, ps.story_url FROM primer_save ps
                 WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id, story_url FROM notas_create UNION DISTINCT
@@ -1169,7 +1183,7 @@ def load_geo_data(_client, start_date: str, end_date: str, email_filter: str = N
                 notas_primer_save AS (
                     SELECT ps.note_id, ps.story_url FROM primer_save ps
                     WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                      AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                      AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
                 ),
                 todas_notas_usuario AS (
                     SELECT note_id, story_url FROM notas_create UNION DISTINCT
@@ -1266,7 +1280,7 @@ def load_top_articles(_client, start_date: str, end_date: str, limit: int = 100,
             notas_primer_save AS (
                 SELECT ps.note_id FROM primer_save ps
                 WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id FROM notas_create UNION DISTINCT
@@ -1299,7 +1313,7 @@ def load_top_articles(_client, start_date: str, end_date: str, limit: int = 100,
             creadores_primer_save AS (
                 SELECT ps.note_id, ps.email_editor as creador_email
                 FROM primer_save_all ps
-                WHERE ps.rn = 1 AND ps.note_id NOT IN (SELECT note_id FROM creadores_create)
+                WHERE ps.rn = 1 AND NOT EXISTS (SELECT 1 FROM creadores_create cc WHERE cc.note_id = ps.note_id)
             ),
             creadores_reales AS (
                 SELECT note_id, creador_email FROM creadores_create
@@ -1576,7 +1590,7 @@ def load_source_efficiency(_client, start_date: str, end_date: str, email_filter
             notas_primer_save AS (
                 SELECT ps.note_id FROM primer_save ps
                 WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                  AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
             ),
             todas_notas_usuario AS (
                 SELECT note_id FROM notas_create UNION DISTINCT
@@ -1735,7 +1749,7 @@ def load_author_productivity(_client, start_date: str, end_date: str, email_filt
                 notas_primer_save AS (
                     SELECT ps.note_id FROM primer_save ps
                     WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                      AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                      AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
                 ),
                 todas_notas_usuario AS (
                     SELECT note_id FROM notas_create UNION DISTINCT
@@ -1810,7 +1824,7 @@ def load_author_productivity(_client, start_date: str, end_date: str, email_filt
                 notas_primer_save AS (
                     SELECT ps.note_id FROM primer_save ps
                     WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                      AND ps.note_id NOT IN (SELECT note_id FROM notas_con_create)
+                      AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
                 ),
                 todas_notas_usuario AS (
                     SELECT note_id FROM notas_create UNION DISTINCT
@@ -2033,18 +2047,20 @@ def render_kpis(kpis: dict, prev_kpis: dict):
         **Volumen de Producción:**
         - **Creadores**: Emails únicos que crearon notas en el período (si hay filtro de autor, muestra solo ese creador)
         - **Publicadores**: Emails únicos que publicaron notas (si hay filtro de autor, muestra quiénes publicaron las notas de ese creador)
-        - **Notas Publicadas**: Total de publicaciones en el período
-        - **Sesiones Únicas**: Cantidad de sesiones (1 usuario puede tener múltiples sesiones en el día)
-        - **Usuarios Únicos**: Cantidad de personas distintas que visitaron las notas
-        - **Tiempo Promedio**: Tiempo de lectura promedio por sesión
-        
+        - **Notas Publicadas**: Notas distintas publicadas por primera vez en el período
+        - **Sesiones Únicas**: Suma de las sesiones diarias de cada nota (una visita que recorre varias notas cuenta en cada una)
+        - **Usuarios Únicos**: Suma de los usuarios únicos diarios de cada nota
+        - **Tiempo Promedio**: Tiempo de interacción activa por sesión, según lo mide GA4 (no incluye el tiempo con la pestaña inactiva)
+
         **Indicadores de Eficiencia:**
         - **Sesiones/Nota**: Promedio de sesiones generadas por cada nota publicada
-        - **Tasa de Scroll**: % de sesiones donde el usuario hizo scroll significativo
+        - **Tasa de Scroll**: % de sesiones que llegaron al final del artículo
         - **Pageviews**: Total de páginas vistas (incluye recargas y navegación interna)
-        - **Sesiones c/ Scroll**: Cantidad de sesiones con scroll significativo
-        
+        - **Sesiones c/ Scroll**: Cantidad de sesiones que llegaron al final del artículo
+
         💡 *El scroll se mide cuando el usuario alcanza el 90% del largo del artículo, según el estándar de GA4.*
+
+        📌 *Las métricas de tráfico corresponden a las notas publicadas dentro del período seleccionado; el tráfico a notas anteriores no se incluye.*
         """)
 
 
@@ -2063,7 +2079,10 @@ def render_impact_zone(top_publishers: pd.DataFrame, top_creators: pd.DataFrame,
             # Renombrar columnas (ahora incluye País)
             display_df.columns = ['Publicador', 'País', 'Notas']
             # Formatear país para mostrar bandera
-            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸', 'MEXICO': '🇲🇽', 'AMERICA': 'AM'}
+            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸', 'MEXICO': '🇲🇽', 'AMERICA': 'AM',
+                          'EL SALVADOR': '🇸🇻', 'GUATEMALA': '🇬🇹', 'HONDURAS': '🇭🇳', 'PANAMA': '🇵🇦',
+                          'COSTA RICA': '🇨🇷', 'NICARAGUA': '🇳🇮', 'VENEZUELA': '🇻🇪',
+                          'REPUBLICA DOMINICANA': '🇩🇴', 'COLABORADOR': '✍️'}
             display_df['País'] = display_df['País'].apply(lambda x: pais_flags.get(str(x).upper(), '') if pd.notna(x) else '')
             st.dataframe(display_df, hide_index=True, use_container_width=True, height=350)
         else:
@@ -2077,7 +2096,10 @@ def render_impact_zone(top_publishers: pd.DataFrame, top_creators: pd.DataFrame,
             # Renombrar columnas (ahora incluye País)
             display_df.columns = ['Creador', 'País', 'Notas']
             # Formatear país para mostrar bandera
-            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸', 'MEXICO': '🇲🇽', 'AMERICA': 'AM'}
+            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸', 'MEXICO': '🇲🇽', 'AMERICA': 'AM',
+                          'EL SALVADOR': '🇸🇻', 'GUATEMALA': '🇬🇹', 'HONDURAS': '🇭🇳', 'PANAMA': '🇵🇦',
+                          'COSTA RICA': '🇨🇷', 'NICARAGUA': '🇳🇮', 'VENEZUELA': '🇻🇪',
+                          'REPUBLICA DOMINICANA': '🇩🇴', 'COLABORADOR': '✍️'}
             display_df['País'] = display_df['País'].apply(lambda x: pais_flags.get(str(x).upper(), '') if pd.notna(x) else '')
             st.dataframe(display_df, hide_index=True, use_container_width=True, height=350)
         else:
@@ -2765,13 +2787,14 @@ def main():
         st.markdown(f"**Período:** {(end - start).days + 1} días")
     
     # Preparar filtros para queries
-    # Convertir display_name de vuelta a email para el filtro
+    # Convertir display_name de vuelta a email para el filtro.
+    # sql_safe: estos valores se interpolan dentro de las queries.
     if selected_display_name != "Todos":
-        email_filter = filter_options['email_options'].get(selected_display_name)
+        email_filter = sql_safe(filter_options['email_options'].get(selected_display_name))
     else:
         email_filter = None
-    seccion_filter = selected_section if selected_section != "Todas" else None
-    pais_filter = selected_pais if selected_pais != "Todos" else None
+    seccion_filter = sql_safe(selected_section) if selected_section != "Todas" else None
+    pais_filter = sql_safe(selected_pais) if selected_pais != "Todos" else None
     
     # Cargar datos optimizados (con filtros aplicados).
     # Ninguno de estos bloques depende del resultado de otro, así que se lanzan
