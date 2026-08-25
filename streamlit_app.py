@@ -399,11 +399,14 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
     join_clause = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(g.creator_email) = LOWER(a.email)" if pais_filter else ""
     
     result = {
-        'visitas_totales': 0, 'pageviews_totales': 0, 
+        'visitas_totales': 0, 'pageviews_totales': 0,
         'tiempo_promedio_min': 0, 'scroll_promedio': 0, 'scrolls_totales': 0,
-        'usuarios_unicos': 0
+        'usuarios_unicos': 0, 'sesiones_unicas': 0,
+        # 'hll' = unicos reales via sketches; 'suma' = metodo historico
+        # (suma de unicos por nota-dia, infla ~31%; medido 19/08/2026)
+        'metodo_unicos': 'suma'
     }
-    
+
     if email_filter:
         # Con filtro de email: usar CTEs para identificar notas del usuario
         query = f"""
@@ -507,6 +510,21 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
             WHERE s.event_date BETWEEN '{start_date}' AND '{end_date}'
               AND s.article_url IN (SELECT story_url FROM urls_del_usuario)
         """
+
+        # Únicos reales via sketches HLL, mismo alcance que la query de tráfico.
+        # Si el rango tiene filas sin sketch (anteriores al backfill) o las
+        # columnas todavía no existen, fetch_unicos cae al método histórico.
+        query_hll = query.replace(
+            """SELECT
+                SUM(g.visits) as visitas_totales,
+                SUM(g.pageviews) as pageviews_totales,
+                SAFE_DIVIDE(SUM(g.total_time_seconds), SUM(g.visits)) as tiempo_promedio_segundos,
+                SAFE_DIVIDE(SUM(g.scrolls), SUM(g.visits)) as scroll_promedio,
+                SUM(g.scrolls) as scrolls_totales""",
+            """SELECT
+                HLL_COUNT.MERGE(g.users_sketch) as usuarios_reales,
+                HLL_COUNT.MERGE(g.sessions_sketch) as sesiones_reales,
+                COUNTIF(g.users_sketch IS NULL) as filas_sin_sketch""")
     else:
         # Sin filtro de email: query simple
         query = f"""
@@ -532,7 +550,21 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
               AND DATE(g.publish_date) BETWEEN '{start_date}' AND '{end_date}'
               {seccion_clause} {pais_clause}
         """
-    
+
+        # Únicos reales via sketches HLL, directo sobre Gold (sin el join a la
+        # Silver de 18 GB que necesita el método histórico).
+        query_hll = f"""
+            SELECT
+                HLL_COUNT.MERGE(g.users_sketch) as usuarios_reales,
+                HLL_COUNT.MERGE(g.sessions_sketch) as sesiones_reales,
+                COUNTIF(g.users_sketch IS NULL) as filas_sin_sketch
+            FROM `{TABLE_PRODUCTIVITY}` g
+            {join_clause}
+            WHERE g.date BETWEEN '{start_date}' AND '{end_date}'
+              AND DATE(g.publish_date) BETWEEN '{start_date}' AND '{end_date}'
+              {seccion_clause} {pais_clause}
+        """
+
     def fetch_trafico():
         parcial = {}
         try:
@@ -557,12 +589,45 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
             pass
         return None
 
-    # Las dos queries son independientes: se lanzan juntas.
-    results = run_parallel({'trafico': fetch_trafico, 'usuarios': fetch_usuarios})
+    def fetch_unicos_hll():
+        """
+        Únicos reales via sketches. Devuelve None si no se puede (columnas
+        inexistentes, error) o si el rango pisa filas sin sketch — en ambos
+        casos se cae al método histórico con etiqueta honesta. El chequeo de
+        cobertura es obligatorio: HLL_COUNT.MERGE ignora los NULL en silencio,
+        y un rango a medio backfillear daría un número plausible pero
+        incompleto.
+        """
+        try:
+            df = _client.query(query_hll).to_dataframe()
+            if df.empty:
+                return None
+            row = df.iloc[0]
+            if int(row['filas_sin_sketch'] or 0) > 0:
+                return None
+            return {
+                'usuarios': int(row['usuarios_reales']) if pd.notna(row['usuarios_reales']) else 0,
+                'sesiones': int(row['sesiones_reales']) if pd.notna(row['sesiones_reales']) else 0,
+            }
+        except:
+            return None
+
+    # Tráfico y únicos-HLL en paralelo; el método histórico de usuarios solo
+    # se ejecuta si el HLL no está disponible para este rango.
+    results = run_parallel({'trafico': fetch_trafico, 'unicos': fetch_unicos_hll})
 
     result.update(results['trafico'])
-    if results['usuarios'] is not None:
-        result['usuarios_unicos'] = results['usuarios']
+
+    if results['unicos'] is not None:
+        result['usuarios_unicos'] = results['unicos']['usuarios']
+        result['sesiones_unicas'] = results['unicos']['sesiones']
+        result['metodo_unicos'] = 'hll'
+    else:
+        usuarios_suma = fetch_usuarios()
+        if usuarios_suma is not None:
+            result['usuarios_unicos'] = usuarios_suma
+        result['sesiones_unicas'] = result['visitas_totales']
+        result['metodo_unicos'] = 'suma'
 
     return result
 
@@ -591,6 +656,8 @@ def load_kpis(_client, start_date: str, end_date: str, email_filter: str = None,
         'publicadores_activos': production['publicadores_activos'],
         'notas_publicadas': production['notas_publicadas'],
         'visitas_totales': traffic['visitas_totales'],
+        'sesiones_unicas': traffic.get('sesiones_unicas', traffic['visitas_totales']),
+        'metodo_unicos': traffic.get('metodo_unicos', 'suma'),
         'usuarios_unicos': traffic['usuarios_unicos'],
         'pageviews_totales': traffic['pageviews_totales'],
         'tiempo_promedio_min': traffic['tiempo_promedio_min'],
@@ -1155,93 +1222,85 @@ def load_section_stats(_client, start_date: str, end_date: str, email_filter: st
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_geo_data(_client, start_date: str, end_date: str, email_filter: str = None, seccion_filter: str = None, pais_filter: str = None) -> pd.DataFrame:
-    """Carga datos geográficos. Usa lógica de PRIMER_SAVE como creador."""
-    
-    if email_filter or seccion_filter or pais_filter:
-        seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
-        pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
-        join_authors = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)" if pais_filter else ""
-        
-        if email_filter:
-            notas_usuario_cte = f"""
-                notas_create AS (
-                    SELECT DISTINCT note_id, story_url FROM `{TABLE_EDITORIAL}`
-                    WHERE email_editor = '{email_filter}' AND action_type = 'CREATE'
-                      AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}' AND story_url IS NOT NULL
-                ),
-                notas_publish AS (
-                    SELECT DISTINCT note_id, story_url FROM `{TABLE_EDITORIAL}`
-                    WHERE email_editor = '{email_filter}' AND action_type = 'FIRST_PUBLISH'
-                      AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}' AND story_url IS NOT NULL
-                ),
-                primer_save AS (
-                    SELECT note_id, email_editor, story_url, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY event_timestamp) as rn
-                    FROM `{TABLE_EDITORIAL}` WHERE action_type = 'SAVE'
-                      AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}' AND story_url IS NOT NULL
-                ),
-                notas_con_create AS (SELECT DISTINCT note_id FROM `{TABLE_EDITORIAL}` WHERE action_type = 'CREATE'),
-                notas_primer_save AS (
-                    SELECT ps.note_id, ps.story_url FROM primer_save ps
-                    WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
-                      AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
-                ),
-                todas_notas_usuario AS (
-                    SELECT note_id, story_url FROM notas_create UNION DISTINCT
-                    SELECT note_id, story_url FROM notas_publish UNION DISTINCT
-                    SELECT note_id, story_url FROM notas_primer_save
-                ),
-                notas_publicadas AS (
-                    SELECT DISTINCT note_id FROM `{TABLE_EDITORIAL}`
-                    WHERE action_type = 'FIRST_PUBLISH' AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
-                ),
-                urls_usuario AS (
-                    SELECT DISTINCT t.story_url FROM todas_notas_usuario t
-                    INNER JOIN notas_publicadas p ON t.note_id = p.note_id
-                    WHERE t.story_url IS NOT NULL
-                ),
-            """
-            note_filter = "AND e.story_url IN (SELECT story_url FROM urls_usuario)"
-            pais_clause = ""
-        else:
-            notas_usuario_cte = ""
-            note_filter = ""
-        
-        query = f"""
-            WITH {notas_usuario_cte}
-            urls_filtradas AS (
-                SELECT DISTINCT e.story_url
-                FROM `{TABLE_EDITORIAL}` e
-                {join_authors}
-                WHERE e.action_type = 'FIRST_PUBLISH'
-                  AND DATE(e.event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
-                  AND e.story_url IS NOT NULL AND e.story_url != ''
-                  {note_filter} {seccion_clause} {pais_clause}
-            )
-            SELECT
-                g.dimension_type,
-                g.dimension_value,
-                SUM(g.visits) as total_visits
-            FROM `{TABLE_GEO_SOURCES}` g
-            INNER JOIN urls_filtradas u ON g.article_url = u.story_url
-            WHERE g.event_date BETWEEN '{start_date}' AND '{end_date}'
-            GROUP BY g.dimension_type, g.dimension_value
-            HAVING total_visits > 0
-            ORDER BY total_visits DESC
-            LIMIT 100
+    """
+    Carga datos geográficos. Usa lógica de PRIMER_SAVE como creador.
+
+    Siempre restringe a las notas publicadas dentro del período (mismo alcance
+    que los KPIs). Antes, la vista sin filtros mostraba el tráfico de TODO el
+    sitio -- portadas y notas viejas incluidas -- y convivía en pantalla con
+    KPIs 30 veces más chicos.
+    """
+    seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
+    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    join_authors = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)" if pais_filter else ""
+
+    if email_filter:
+        notas_usuario_cte = f"""
+            notas_create AS (
+                SELECT DISTINCT note_id, story_url FROM `{TABLE_EDITORIAL}`
+                WHERE email_editor = '{email_filter}' AND action_type = 'CREATE'
+                  AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}' AND story_url IS NOT NULL
+            ),
+            notas_publish AS (
+                SELECT DISTINCT note_id, story_url FROM `{TABLE_EDITORIAL}`
+                WHERE email_editor = '{email_filter}' AND action_type = 'FIRST_PUBLISH'
+                  AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}' AND story_url IS NOT NULL
+            ),
+            primer_save AS (
+                SELECT note_id, email_editor, story_url, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY event_timestamp) as rn
+                FROM `{TABLE_EDITORIAL}` WHERE action_type = 'SAVE'
+                  AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}' AND story_url IS NOT NULL
+            ),
+            notas_con_create AS (SELECT DISTINCT note_id FROM `{TABLE_EDITORIAL}` WHERE action_type = 'CREATE'),
+            notas_primer_save AS (
+                SELECT ps.note_id, ps.story_url FROM primer_save ps
+                WHERE ps.rn = 1 AND ps.email_editor = '{email_filter}'
+                  AND NOT EXISTS (SELECT 1 FROM notas_con_create nc WHERE nc.note_id = ps.note_id)
+            ),
+            todas_notas_usuario AS (
+                SELECT note_id, story_url FROM notas_create UNION DISTINCT
+                SELECT note_id, story_url FROM notas_publish UNION DISTINCT
+                SELECT note_id, story_url FROM notas_primer_save
+            ),
+            notas_publicadas AS (
+                SELECT DISTINCT note_id FROM `{TABLE_EDITORIAL}`
+                WHERE action_type = 'FIRST_PUBLISH' AND DATE(event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
+            ),
+            urls_usuario AS (
+                SELECT DISTINCT t.story_url FROM todas_notas_usuario t
+                INNER JOIN notas_publicadas p ON t.note_id = p.note_id
+                WHERE t.story_url IS NOT NULL
+            ),
         """
+        note_filter = "AND e.story_url IN (SELECT story_url FROM urls_usuario)"
+        pais_clause = ""
     else:
-        query = f"""
-            SELECT
-                dimension_type,
-                dimension_value,
-                SUM(visits) as total_visits
-            FROM `{TABLE_GEO_SOURCES}`
-            WHERE event_date BETWEEN '{start_date}' AND '{end_date}'
-            GROUP BY dimension_type, dimension_value
-            HAVING total_visits > 0
-            ORDER BY total_visits DESC
-            LIMIT 100
-        """
+        notas_usuario_cte = ""
+        note_filter = ""
+    
+    query = f"""
+        WITH {notas_usuario_cte}
+        urls_filtradas AS (
+            SELECT DISTINCT e.story_url
+            FROM `{TABLE_EDITORIAL}` e
+            {join_authors}
+            WHERE e.action_type = 'FIRST_PUBLISH'
+              AND DATE(e.event_timestamp) BETWEEN '{start_date}' AND '{end_date}'
+              AND e.story_url IS NOT NULL AND e.story_url != ''
+              {note_filter} {seccion_clause} {pais_clause}
+        )
+        SELECT
+            g.dimension_type,
+            g.dimension_value,
+            SUM(g.visits) as total_visits
+        FROM `{TABLE_GEO_SOURCES}` g
+        INNER JOIN urls_filtradas u ON g.article_url = u.story_url
+        WHERE g.event_date BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY g.dimension_type, g.dimension_value
+        HAVING total_visits > 0
+        ORDER BY total_visits DESC
+        LIMIT 100
+    """
     
     try:
         return _client.query(query).to_dataframe()
@@ -1992,15 +2051,21 @@ def render_kpis(kpis: dict, prev_kpis: dict):
             f"{kpis['notas_publicadas']:,}"
         ), unsafe_allow_html=True)
     
+    # Con sketches disponibles para todo el rango, los KPI muestran únicos
+    # reales. Si el rango pisa fechas sin la medición nueva, se cae a la suma
+    # histórica con etiqueta honesta (infla: cada lector cuenta una vez por
+    # nota y por día).
+    hll = kpis.get('metodo_unicos') == 'hll'
+
     with col4:
         st.markdown(render_kpi_card(
-            "Sesiones Únicas", 
-            format_number(kpis['visitas_totales'])
+            "Sesiones Únicas" if hll else "Sesiones (suma diaria)",
+            format_number(kpis.get('sesiones_unicas', kpis['visitas_totales']))
         ), unsafe_allow_html=True)
-    
+
     with col5:
         st.markdown(render_kpi_card(
-            "Usuarios Únicos", 
+            "Usuarios Únicos" if hll else "Alcance (suma diaria)",
             format_number(kpis.get('usuarios_unicos', 0))
         ), unsafe_allow_html=True)
     
@@ -2048,8 +2113,9 @@ def render_kpis(kpis: dict, prev_kpis: dict):
         - **Creadores**: Emails únicos que crearon notas en el período (si hay filtro de autor, muestra solo ese creador)
         - **Publicadores**: Emails únicos que publicaron notas (si hay filtro de autor, muestra quiénes publicaron las notas de ese creador)
         - **Notas Publicadas**: Notas distintas publicadas por primera vez en el período
-        - **Sesiones Únicas**: Suma de las sesiones diarias de cada nota (una visita que recorre varias notas cuenta en cada una)
-        - **Usuarios Únicos**: Suma de los usuarios únicos diarios de cada nota
+        - **Sesiones Únicas**: Sesiones distintas que visitaron las notas del período (una visita que recorre varias notas cuenta una sola vez)
+        - **Usuarios Únicos**: Personas distintas que visitaron las notas del período
+        - Si el rango elegido incluye fechas anteriores a la medición precisa, estas dos tarjetas pasan a llamarse **"Sesiones (suma diaria)"** y **"Alcance (suma diaria)"**: suman los únicos de cada nota y día, por lo que un mismo lector puede contarse más de una vez
         - **Tiempo Promedio**: Tiempo de interacción activa por sesión, según lo mide GA4 (no incluye el tiempo con la pestaña inactiva)
 
         **Indicadores de Eficiencia:**
@@ -2822,6 +2888,14 @@ def main():
 
     # Renderizar dashboard
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+    # Alcance visible: todas las métricas refieren a la producción del período
+    # elegido (decisión de producto: el tablero mide lo que se publicó, no el
+    # tráfico total del sitio).
+    st.markdown(
+        f'<p style="color:{GRIS_TEXTO}; font-size:0.85rem; margin-bottom:8px;">'
+        f'Métricas sobre las notas publicadas entre el {start.strftime("%d/%m/%Y")} '
+        f'y el {end.strftime("%d/%m/%Y")}. El tráfico a notas anteriores no se incluye.</p>',
+        unsafe_allow_html=True)
     render_kpis(kpis, prev_kpis)
     
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
