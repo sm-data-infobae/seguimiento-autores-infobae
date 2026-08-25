@@ -133,6 +133,26 @@ def run_parallel(tasks: dict, max_workers: int = 8) -> dict:
         return {name: future.result() for name, future in futures.items()}
 
 
+# Opción especial del filtro de país: autores activos que NO están en la tabla
+# de autores. Antes eran invisibles bajo cualquier filtro de país.
+SIN_ASIGNAR = "— Sin asignar —"
+
+
+def pais_sql(pais_filter, email_col="e.email_editor"):
+    """
+    Cláusula SQL del filtro de país. Con SIN_ASIGNAR devuelve los editores sin
+    fila en la tabla de autores, excluyendo los usuarios de sistema (agencias,
+    scribnews, middleware) para que las 6.700 notas automáticas semanales no
+    sepulten a las personas.
+    """
+    if not pais_filter:
+        return ""
+    if pais_filter == SIN_ASIGNAR:
+        return (f"AND a.email IS NULL AND LOWER({email_col}) NOT IN "
+                "('infobae', 'scribnews', 'infobae middleware')")
+    return f"AND UPPER(a.country) = UPPER('{pais_filter}')"
+
+
 def sql_safe(valor):
     """
     Escapa un valor que va interpolado dentro de comillas simples en SQL.
@@ -171,7 +191,7 @@ def load_production_metrics(_client, start_date: str, end_date: str, email_filte
     Notas "publicadas" = notas "del usuario" que tienen FIRST_PUBLISH
     """
     seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "e.email_editor")
     join_clause = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)" if pais_filter else ""
     
     creadores = 0
@@ -395,7 +415,7 @@ def load_traffic_metrics(_client, start_date: str, end_date: str, email_filter: 
     TABLE_SILVER = "data-prod-454014.Silver.GA4_productivity_cleaned"
     
     seccion_clause = f"AND g.section = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "g.creator_email")
     join_clause = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(g.creator_email) = LOWER(a.email)" if pais_filter else ""
     
     result = {
@@ -691,7 +711,7 @@ def load_top_publishers(_client, start_date: str, end_date: str, limit: int = 10
     - Sin filtro: muestra los publicadores con más FIRST_PUBLISH
     """
     seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "e.email_editor")
     
     if email_filter:
         # Mostrar QUIÉN PUBLICÓ las notas del usuario (no necesariamente el usuario)
@@ -783,7 +803,7 @@ def load_top_creators(_client, start_date: str, end_date: str, limit: int = 10, 
     - Sin filtro: muestra los creadores con más notas
     """
     seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "e.email_editor")
     
     if email_filter:
         # Mostrar QUIÉN CREÓ las notas del usuario (CREATE o PRIMER_SAVE sin CREATE)
@@ -892,7 +912,7 @@ def load_daily_evolution(_client, start_date: str, end_date: str, metric: str = 
     TABLE_SILVER = "data-prod-454014.Silver.GA4_productivity_cleaned"
     seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
     seccion_clause_gold = f"AND g.section = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "e.email_editor")
     join_clause = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)" if pais_filter else ""
     
     if metric == 'notas':
@@ -1231,7 +1251,7 @@ def load_geo_data(_client, start_date: str, end_date: str, email_filter: str = N
     KPIs 30 veces más chicos.
     """
     seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "e.email_editor")
     join_authors = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)" if pais_filter else ""
 
     if email_filter:
@@ -1314,7 +1334,7 @@ def load_top_articles(_client, start_date: str, end_date: str, limit: int = 100,
     Carga top artículos. Usa lógica de PRIMER_SAVE como creador.
     """
     seccion_clause = f"AND g.section = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "g.creator_email")
     join_authors = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(g.creator_email) = LOWER(a.email)" if pais_filter else ""
     
     if email_filter:
@@ -1625,7 +1645,7 @@ def load_source_efficiency(_client, start_date: str, end_date: str, email_filter
     Usa lógica de PRIMER_SAVE como creador.
     """
     seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "e.email_editor")
     join_authors = f"LEFT JOIN `{TABLE_AUTHORS}` a ON LOWER(e.email_editor) = LOWER(a.email)" if pais_filter else ""
     
     if email_filter:
@@ -1775,7 +1795,7 @@ def load_author_productivity(_client, start_date: str, end_date: str, email_filt
     - participated: muestra al usuario con todas sus notas
     """
     seccion_clause = f"AND e.segment = '{seccion_filter}'" if seccion_filter else ""
-    pais_clause = f"AND UPPER(a.country) = UPPER('{pais_filter}')" if pais_filter else ""
+    pais_clause = pais_sql(pais_filter, "e.email_editor")
     min_notas = 1 if email_filter else 3
     
     if metric_type == "created":
@@ -2834,7 +2854,8 @@ def main():
         )
         
         # Filtro por país
-        pais_options = ["Todos"] + filter_options['paises']
+        # "Sin asignar" al final: autores activos que no estan en la tabla
+        pais_options = ["Todos"] + filter_options['paises'] + [SIN_ASIGNAR]
         selected_pais = st.selectbox(
             "País del autor",
             options=pais_options,
