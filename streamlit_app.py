@@ -2807,6 +2807,11 @@ def main():
             if st.button("🔄 Refrescar datos", help="Limpia el caché y recarga los datos desde BigQuery"):
                 st.cache_data.clear()
                 st.rerun()
+
+            # Brief mensual (informe fijo por mes cerrado, estética informe de audiencias)
+            if hasattr(st, "page_link"):
+                st.page_link("pages/1_📋_Brief_mensual.py", label="📋 Brief mensual",
+                             help="Informe del mes cerrado, listo para compartir")
         else:
             st.markdown('<span class="status-badge status-error">✗ Sin conexión</span>', unsafe_allow_html=True)
             st.info("⚙️ Configura las credenciales en Settings → Secrets")

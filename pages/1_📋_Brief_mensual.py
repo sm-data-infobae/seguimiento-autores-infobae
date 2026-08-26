@@ -1,0 +1,77 @@
+"""
+📋 Brief Mensual — informe fijo por mes cerrado del Centro de Control Editorial.
+
+Réplica de la estética del Informe de Audiencias de monitor-tendencias, con los
+datos del tablero de Seguimiento de Autores. El HTML es autocontenido: se ve
+embebido acá y se puede descargar para compartir.
+"""
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+from brief.queries import (closed_months, get_bigquery_client, get_last_data_date,
+                           load_brief_data, month_label)
+from brief.template import render_brief_html
+
+st.set_page_config(
+    page_title="Infobae | Brief Mensual de Autores",
+    page_icon="📋",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+    /* La página se pinta oscura para que el brief embebido no flote sobre fondo claro */
+    .stApp { background-color: #0A0A0C; }
+    section[data-testid="stSidebar"] { background-color: #141416; }
+    section[data-testid="stSidebar"] * { color: #C3C2B7; }
+    .block-container { padding-top: 2rem; max-width: 1260px; }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+client = get_bigquery_client()
+if client is None:
+    st.error("Sin conexión a BigQuery. Configurá las credenciales en Settings → Secrets.")
+    st.stop()
+
+ultima_fecha = get_last_data_date(client)
+meses = closed_months(ultima_fecha, limit=12)
+if not meses:
+    st.warning("Todavía no hay ningún mes cerrado con datos.")
+    st.stop()
+
+with st.sidebar:
+    st.markdown("### 📋 Brief mensual")
+    st.caption("Informe fijo por mes cerrado. Compara siempre contra el mes anterior completo.")
+    seleccion = st.selectbox(
+        "Mes",
+        options=meses,
+        format_func=lambda ym: month_label(*ym),
+        key="brief_month",
+    )
+    if st.button("🔄 Regenerar", help="Limpia el caché del brief y vuelve a consultar BigQuery"):
+        load_brief_data.clear()
+        st.rerun()
+    st.markdown("---")
+    if hasattr(st, "page_link"):
+        st.page_link("streamlit_app.py", label="⬅️ Volver al tablero")
+
+year, month = seleccion
+with st.spinner(f"Generando el brief de {month_label(year, month)}… (la primera vez tarda un rato)"):
+    data = load_brief_data(client, year, month)
+    html = render_brief_html(data)
+
+col1, col2 = st.columns([1, 5])
+with col1:
+    st.download_button(
+        "⬇️ Descargar HTML",
+        data=html.encode("utf-8"),
+        file_name=f"brief-autores-{year}-{month:02d}.html",
+        mime="text/html",
+        help="El archivo es autocontenido: se puede abrir suelto o compartir por mail/Slack.",
+    )
+
+components.html(html, height=6600, scrolling=True)
