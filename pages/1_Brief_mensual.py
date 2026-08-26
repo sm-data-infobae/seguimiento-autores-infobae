@@ -22,11 +22,14 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* La página se pinta oscura para que el brief embebido no flote sobre fondo claro */
+    /* La página se pinta oscura y el brief ocupa todo el ancho, sin chrome de Streamlit */
     .stApp { background-color: #0A0A0C; }
+    header[data-testid="stHeader"] { background: transparent; }
     section[data-testid="stSidebar"] { background-color: #141416; }
     section[data-testid="stSidebar"] * { color: #C3C2B7; }
-    .block-container { padding-top: 2rem; max-width: 1260px; }
+    .block-container { padding: 0 !important; max-width: 100% !important; }
+    /* El iframe del brief llena el viewport: un solo scroll, el de adentro */
+    .block-container iframe { height: calc(100vh - 4rem) !important; width: 100% !important; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
 </style>
@@ -52,7 +55,23 @@ with st.sidebar:
         format_func=lambda ym: month_label(*ym),
         key="brief_month",
     )
-    if st.button("🔄 Regenerar", help="Limpia el caché del brief y vuelve a consultar BigQuery"):
+
+year, month = seleccion
+with st.spinner(f"Generando el brief de {month_label(year, month)}… (la primera vez tarda un rato)"):
+    data = load_brief_data(client, year, month)
+    html = render_brief_html(data)
+
+with st.sidebar:
+    st.download_button(
+        "⬇️ Descargar HTML",
+        data=html.encode("utf-8"),
+        file_name=f"brief-autores-{year}-{month:02d}.html",
+        mime="text/html",
+        help="El archivo es autocontenido: se puede abrir suelto o compartir por mail/Slack.",
+        use_container_width=True,
+    )
+    if st.button("🔄 Regenerar", help="Limpia el caché del brief y vuelve a consultar BigQuery",
+                 use_container_width=True):
         load_brief_data.clear()
         st.rerun()
     st.markdown("---")
@@ -62,19 +81,5 @@ with st.sidebar:
         except Exception:
             pass
 
-year, month = seleccion
-with st.spinner(f"Generando el brief de {month_label(year, month)}… (la primera vez tarda un rato)"):
-    data = load_brief_data(client, year, month)
-    html = render_brief_html(data)
-
-col1, col2 = st.columns([1, 5])
-with col1:
-    st.download_button(
-        "⬇️ Descargar HTML",
-        data=html.encode("utf-8"),
-        file_name=f"brief-autores-{year}-{month:02d}.html",
-        mime="text/html",
-        help="El archivo es autocontenido: se puede abrir suelto o compartir por mail/Slack.",
-    )
-
-components.html(html, height=6600, scrolling=True)
+# La altura real la fija el CSS de arriba (100vh); este valor es solo el fallback.
+components.html(html, height=900, scrolling=True)
