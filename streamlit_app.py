@@ -2808,10 +2808,15 @@ def main():
                 st.cache_data.clear()
                 st.rerun()
 
-            # Brief mensual (informe fijo por mes cerrado, estética informe de audiencias)
+            # Brief mensual (informe fijo por mes cerrado, estética informe de audiencias).
+            # En try/except: si Streamlit no registró la página (deploy a medio
+            # reiniciar), el tablero tiene que seguir andando igual.
             if hasattr(st, "page_link"):
-                st.page_link("pages/1_📋_Brief_mensual.py", label="📋 Brief mensual",
-                             help="Informe del mes cerrado, listo para compartir")
+                try:
+                    st.page_link("pages/1_Brief_mensual.py", label="📋 Brief mensual",
+                                 help="Informe del mes cerrado, listo para compartir")
+                except Exception:
+                    pass
         else:
             st.markdown('<span class="status-badge status-error">✗ Sin conexión</span>', unsafe_allow_html=True)
             st.info("⚙️ Configura las credenciales en Settings → Secrets")

@@ -57,7 +57,10 @@ with st.sidebar:
         st.rerun()
     st.markdown("---")
     if hasattr(st, "page_link"):
-        st.page_link("streamlit_app.py", label="⬅️ Volver al tablero")
+        try:
+            st.page_link("streamlit_app.py", label="⬅️ Volver al tablero")
+        except Exception:
+            pass
 
 year, month = seleccion
 with st.spinner(f"Generando el brief de {month_label(year, month)}… (la primera vez tarda un rato)"):
