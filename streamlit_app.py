@@ -2165,10 +2165,9 @@ def render_impact_zone(top_publishers: pd.DataFrame, top_creators: pd.DataFrame,
             # Renombrar columnas (ahora incluye País)
             display_df.columns = ['Publicador', 'País', 'Notas']
             # Formatear país para mostrar bandera
-            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸', 'MEXICO': '🇲🇽', 'AMERICA': 'AM',
-                          'EL SALVADOR': '🇸🇻', 'GUATEMALA': '🇬🇹', 'HONDURAS': '🇭🇳', 'PANAMA': '🇵🇦',
-                          'COSTA RICA': '🇨🇷', 'NICARAGUA': '🇳🇮', 'VENEZUELA': '🇻🇪',
-                          'REPUBLICA DOMINICANA': '🇩🇴', 'COLABORADOR': '✍️'}
+            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸',
+                          'MEXICO': '🇲🇽', 'ESTADOS UNIDOS': '🇺🇸', 'EL SALVADOR': '🇸🇻',
+                          'AMERICA': 'AM', 'CENTROAMERICA': 'CA', 'COLABORADOR': '✍️'}
             display_df['País'] = display_df['País'].apply(lambda x: pais_flags.get(str(x).upper(), '') if pd.notna(x) else '')
             st.dataframe(display_df, hide_index=True, use_container_width=True, height=350)
         else:
@@ -2182,10 +2181,9 @@ def render_impact_zone(top_publishers: pd.DataFrame, top_creators: pd.DataFrame,
             # Renombrar columnas (ahora incluye País)
             display_df.columns = ['Creador', 'País', 'Notas']
             # Formatear país para mostrar bandera
-            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸', 'MEXICO': '🇲🇽', 'AMERICA': 'AM',
-                          'EL SALVADOR': '🇸🇻', 'GUATEMALA': '🇬🇹', 'HONDURAS': '🇭🇳', 'PANAMA': '🇵🇦',
-                          'COSTA RICA': '🇨🇷', 'NICARAGUA': '🇳🇮', 'VENEZUELA': '🇻🇪',
-                          'REPUBLICA DOMINICANA': '🇩🇴', 'COLABORADOR': '✍️'}
+            pais_flags = {'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸',
+                          'MEXICO': '🇲🇽', 'ESTADOS UNIDOS': '🇺🇸', 'EL SALVADOR': '🇸🇻',
+                          'AMERICA': 'AM', 'CENTROAMERICA': 'CA', 'COLABORADOR': '✍️'}
             display_df['País'] = display_df['País'].apply(lambda x: pais_flags.get(str(x).upper(), '') if pd.notna(x) else '')
             st.dataframe(display_df, hide_index=True, use_container_width=True, height=350)
         else:
