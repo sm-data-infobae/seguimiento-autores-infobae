@@ -78,7 +78,7 @@ def delta_pct(cur, prev):
 def delta_html(cur, prev, vs_label) -> str:
     d = delta_pct(cur, prev)
     if d is None:
-        return f'<span class="delta muted">— <span class="vs">{esc(vs_label)}</span></span>'
+        return f'<span class="vs">sin comparación vs. {esc(vs_label)}</span>'
     color, arrow = (UP, "▲") if d >= 0 else (DOWN, "▼")
     return (f'<span class="delta" style="color:{color}">{arrow} {fmt_dec(abs(d))} %</span>'
             f' <span class="vs">vs. {esc(vs_label)}</span>')
@@ -149,7 +149,7 @@ def svg_line_chart(points, width=1060, height=260, color=ACCENT) -> str:
         x1 = min(pad_l + iw, x(i) + half)
         hits.append(f'<rect class="hit" x="{x0:.1f}" y="{pad_t}" width="{x1 - x0:.1f}" height="{ih}" '
                     f'data-cx="{x(i):.1f}" data-cy="{y(v):.1f}" '
-                    f'data-label="{esc(fecha_es(d))} · {fmt_int(v)}"/>')
+                    f'data-label="{esc(fecha_es_semana(d))} · {fmt_int(v)}"/>')
 
     return f"""
     <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto" xmlns="http://www.w3.org/2000/svg" role="img">
@@ -181,10 +181,18 @@ def chapter_header(num, kicker, title, measure_note="") -> str:
 
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 
 
 def fecha_es(iso) -> str:
     return f"{int(iso[8:10])} de {MESES[int(iso[5:7]) - 1]}"
+
+
+def fecha_es_semana(iso) -> str:
+    """'2026-07-15' -> 'miércoles 15 de julio' (para los tooltips de los charts)."""
+    from datetime import date as _date
+    dia = DIAS_SEMANA[_date(int(iso[:4]), int(iso[5:7]), int(iso[8:10])).weekday()]
+    return f"{dia} {fecha_es(iso)}"
 
 
 # ─────────────────────────────── documento ───────────────────────────────
@@ -286,7 +294,7 @@ def render_brief_html(data: dict) -> str:
              text-transform:uppercase; }}
   h1 {{ font-size:clamp(2.6rem, 7vw, 5rem); font-weight:700; line-height:1.05; margin:16px 0 36px;
         letter-spacing:-.02em; max-width:820px; }}
-  .hero {{ display:flex; align-items:baseline; gap:18px; flex-wrap:wrap; margin:48px 0 8px; }}
+  .hero {{ display:flex; align-items:center; gap:22px; flex-wrap:wrap; margin:48px 0 8px; }}
   .hero-num {{ color:{ACCENT}; font-size:clamp(3.4rem, 9vw, 6.4rem); font-weight:800; letter-spacing:-.03em;
                line-height:1; }}
   .hero-side {{ max-width:280px; color:{TEXT2}; font-size:1rem; line-height:1.4; }}
