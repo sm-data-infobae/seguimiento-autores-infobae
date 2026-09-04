@@ -140,13 +140,15 @@ def svg_line_chart(points, width=1060, height=260, color=ACCENT) -> str:
         ticks.append(f'<text x="{x(i):.0f}" y="{height - 10}" class="tick" text-anchor="middle">{int(d[8:10])}</text>')
     imax = vals.index(max(vals))
 
-    # Columnas invisibles por día: alimentan el tooltip de hover (JS del documento)
+    # Columnas invisibles por día: alimentan el tooltip de hover y el punto que
+    # sigue al cursor sobre la línea (JS del documento)
     hits = []
     half = iw / (n - 1) / 2
     for i, (d, v) in enumerate(points):
         x0 = max(pad_l, x(i) - half)
         x1 = min(pad_l + iw, x(i) + half)
         hits.append(f'<rect class="hit" x="{x0:.1f}" y="{pad_t}" width="{x1 - x0:.1f}" height="{ih}" '
+                    f'data-cx="{x(i):.1f}" data-cy="{y(v):.1f}" '
                     f'data-label="{esc(fecha_es(d))} · {fmt_int(v)}"/>')
 
     return f"""
@@ -166,6 +168,7 @@ def svg_line_chart(points, width=1060, height=260, color=ACCENT) -> str:
       <text x="{x(imax):.0f}" y="{y(vals[imax]) - 10:.0f}" class="tick" style="fill:{TEXT2}" text-anchor="middle">{fmt_big(vals[imax])}</text>
       {"".join(ticks)}
       {"".join(hits)}
+      <circle class="cursor-pt" r="4.5" fill="{color}" stroke="{BG}" stroke-width="2" style="display:none"/>
     </svg>"""
 
 
@@ -195,6 +198,11 @@ def render_brief_html(data: dict) -> str:
     p, pp = data['production'], data['prev_production']
     t, pt = data['traffic'], data['prev_traffic']
     hll = t.get('metodo_unicos') == 'hll'
+    # Si un mes mide únicos con HLL y el otro con suma diaria, el delta compara
+    # metodologías distintas (la suma infla ~31 %): mejor no mostrarlo.
+    mismo_metodo = t.get('metodo_unicos') == pt.get('metodo_unicos')
+    pt_usuarios = pt['usuarios_unicos'] if mismo_metodo else None
+    pt_sesiones = pt['sesiones_unicas'] if mismo_metodo else None
 
     # ── Portada ──
     hero_delta = delta_html(p['notas'], pp['notas'], prev_corto)
@@ -208,9 +216,9 @@ def render_brief_html(data: dict) -> str:
         kpi_card("Creadores activos", fmt_int(p['creadores']), delta_html(p['creadores'], pp['creadores'], prev_label)),
         kpi_card("Publicadores activos", fmt_int(p['publicadores']), delta_html(p['publicadores'], pp['publicadores'], prev_label)),
         kpi_card("Usuarios únicos" if hll else "Alcance (suma diaria)", fmt_big(t['usuarios_unicos']),
-                 delta_html(t['usuarios_unicos'], pt['usuarios_unicos'], prev_label), highlight=True),
+                 delta_html(t['usuarios_unicos'], pt_usuarios, prev_label), highlight=True),
         kpi_card("Sesiones únicas" if hll else "Sesiones (suma diaria)", fmt_big(t['sesiones_unicas']),
-                 delta_html(t['sesiones_unicas'], pt['sesiones_unicas'], prev_label)),
+                 delta_html(t['sesiones_unicas'], pt_sesiones, prev_label)),
         kpi_card("Visitas", fmt_big(t['visitas']), delta_html(t['visitas'], pt['visitas'], prev_label)),
         kpi_card("Pageviews", fmt_big(t['pageviews']), delta_html(t['pageviews'], pt['pageviews'], prev_label)),
         kpi_card("Tiempo promedio", f"{fmt_dec(t['tiempo_min'])} min", delta_html(t['tiempo_min'], pt['tiempo_min'], prev_label)),
@@ -270,7 +278,9 @@ def render_brief_html(data: dict) -> str:
   body {{ background:{BG}; color:{TEXT}; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
          -webkit-font-smoothing:antialiased; }}
   .progress {{ position:fixed; top:0; left:0; height:3px; background:{ACCENT}; width:0; z-index:10; }}
-  .wrap {{ max-width:1160px; margin:0 auto; padding:0 48px 80px; }}
+  /* Columna líquida: en monitores grandes se estira hasta 1500px en vez de dejar
+     márgenes muertos; en chicos ocupa todo el ancho. */
+  .wrap {{ max-width:clamp(1100px, 82vw, 1500px); margin:0 auto; padding:0 48px 80px; }}
   .logo {{ color:{ACCENT}; font-size:2.6rem; font-weight:800; letter-spacing:-1px; padding-top:64px; }}
   .kicker {{ color:{ACCENT}; font-size:.8rem; font-weight:700; letter-spacing:.22em; margin-top:40px;
              text-transform:uppercase; }}
@@ -373,7 +383,7 @@ def render_brief_html(data: dict) -> str:
   </div>
   <div class="hero" style="margin-top:10px">
     <div class="hero-num" style="font-size:clamp(2rem,5vw,3.4rem); color:{TEXT}">{fmt_big(t['usuarios_unicos'])}</div>
-    <div class="hero-side">{esc(usuarios_label)}<br>{delta_html(t['usuarios_unicos'], pt['usuarios_unicos'], prev_corto)}</div>
+    <div class="hero-side">{esc(usuarios_label)}<br>{delta_html(t['usuarios_unicos'], pt_usuarios, prev_corto)}</div>
   </div>
 
   <div class="kicker" style="margin-top:64px">{esc(mes_corto)} en seis cifras</div>
@@ -446,17 +456,27 @@ def render_brief_html(data: dict) -> str:
       (h.scrollTop / (h.scrollHeight - h.clientHeight) * 100) + '%';
   }}, {{passive: true}});
 
-  // Tooltip de hover: cualquier elemento con data-label lo muestra junto al cursor
+  // Tooltip de hover: cualquier elemento con data-label lo muestra junto al cursor.
+  // En los charts de línea, además, un punto acompaña al cursor sobre la serie.
   const tip = document.getElementById('tip');
   document.querySelectorAll('[data-label]').forEach(el => {{
+    const pt = el.dataset.cx ? el.closest('svg').querySelector('.cursor-pt') : null;
     el.addEventListener('mousemove', e => {{
       tip.textContent = el.dataset.label;
       tip.style.display = 'block';
       const w = tip.offsetWidth;
       tip.style.left = Math.min(e.clientX + 14, innerWidth - w - 8) + 'px';
       tip.style.top = (e.clientY - 34) + 'px';
+      if (pt) {{
+        pt.setAttribute('cx', el.dataset.cx);
+        pt.setAttribute('cy', el.dataset.cy);
+        pt.style.display = 'block';
+      }}
     }});
-    el.addEventListener('mouseleave', () => {{ tip.style.display = 'none'; }});
+    el.addEventListener('mouseleave', () => {{
+      tip.style.display = 'none';
+      if (pt) pt.style.display = 'none';
+    }});
   }});
 </script>
 </body></html>"""

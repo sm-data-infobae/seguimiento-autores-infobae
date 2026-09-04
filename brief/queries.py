@@ -24,6 +24,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 TABLE_PRODUCTIVITY = "data-prod-454014.Gold.GA4_ARC_author_productivity_daily"
+TABLE_PRODUCTIVITY_SILVER = "data-prod-454014.Silver.GA4_productivity_cleaned"
 TABLE_EDITORIAL = "data-prod-454014.Silver.arc_editorial_activity"
 TABLE_AUTHORS = "data-prod-454014.Bronze.authors_infobae_raw"
 
@@ -181,6 +182,20 @@ def _traffic(client, start, end) -> dict:
         result['sesiones_unicas'] = int(r['sesiones_hll']) if pd.notna(r['sesiones_hll']) else 0
         result['metodo_unicos'] = 'hll'
     else:
+        # Fallback del tablero: suma de únicos por nota y día desde la Silver
+        # (puede repetir lectores; la etiqueta del brief lo aclara).
+        query_suma = f"""
+            SELECT SUM(s.daily_users) as usuarios
+            FROM `{TABLE_PRODUCTIVITY_SILVER}` s
+            INNER JOIN `{TABLE_PRODUCTIVITY}` g
+                ON s.article_url = g.article_url AND s.event_date = g.date
+            WHERE s.event_date BETWEEN '{start}' AND '{end}'
+              AND DATE(g.publish_date) BETWEEN '{start}' AND '{end}'
+              {SIN_AGENCIAS_GOLD}
+        """
+        df_suma = _df(client, query_suma)
+        if not df_suma.empty and pd.notna(df_suma.iloc[0]['usuarios']):
+            result['usuarios_unicos'] = int(df_suma.iloc[0]['usuarios'])
         result['sesiones_unicas'] = result['visitas']
     return result
 
