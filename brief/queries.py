@@ -6,6 +6,12 @@ ejecutaría su st.set_page_config y su CSS sobre la página del brief).
 Los patrones SQL son los mismos del tablero en su variante sin filtros;
 si se toca una definición allá (creador, publicador, alcance del tráfico),
 hay que replicarla acá.
+
+Las notas de agencias (usuario 'infobae': EFE, EuropaPress, Narrativa, etc.)
+quedan afuera de todos los agregados salvo _sources, que es el capítulo que
+compara Composer/Scribnews/Agencias. Sin esta exclusión las ~34 mil notas
+automáticas mensuales sepultan a la redacción en producción, secciones y
+tiempo de lectura (20,6 s de promedio de agencias vs 58,7 s de humanos).
 """
 
 import calendar
@@ -23,6 +29,11 @@ TABLE_AUTHORS = "data-prod-454014.Bronze.authors_infobae_raw"
 
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+
+# Exclusión de agencias. En editorial el usuario es 'infobae'; en Gold el
+# creator_email puede venir NULL, por eso el COALESCE.
+SIN_AGENCIAS_ED = "AND LOWER(e.email_editor) != 'infobae'"
+SIN_AGENCIAS_GOLD = "AND LOWER(COALESCE(g.creator_email, '')) != 'infobae'"
 
 
 @st.cache_resource
@@ -115,6 +126,7 @@ def _production(client, start, end) -> dict:
         FROM `{TABLE_EDITORIAL}` e
         WHERE e.action_type IN ('CREATE', 'FIRST_PUBLISH')
           AND DATE(e.event_timestamp) BETWEEN '{start}' AND '{end}'
+          {SIN_AGENCIAS_ED}
     """
     df = _df(client, query)
     if df.empty:
@@ -131,6 +143,7 @@ def _traffic(client, start, end) -> dict:
         FROM `{TABLE_PRODUCTIVITY}` g
         WHERE g.date BETWEEN '{start}' AND '{end}'
           AND DATE(g.publish_date) BETWEEN '{start}' AND '{end}'
+          {SIN_AGENCIAS_GOLD}
     """
     query_hll = f"""
         SELECT
@@ -178,6 +191,7 @@ def _daily_notas(client, start, end) -> list:
         FROM `{TABLE_EDITORIAL}` e
         WHERE e.action_type = 'FIRST_PUBLISH'
           AND DATE(e.event_timestamp) BETWEEN '{start}' AND '{end}'
+          {SIN_AGENCIAS_ED}
         GROUP BY fecha ORDER BY fecha
     """
     df = _df(client, query)
@@ -190,6 +204,7 @@ def _daily_visitas(client, start, end) -> list:
         FROM `{TABLE_PRODUCTIVITY}` g
         WHERE g.date BETWEEN '{start}' AND '{end}'
           AND DATE(g.publish_date) BETWEEN '{start}' AND '{end}'
+          {SIN_AGENCIAS_GOLD}
         GROUP BY fecha ORDER BY fecha
     """
     df = _df(client, query)
@@ -200,8 +215,7 @@ def _top_authors(client, start, end, action, limit=10) -> list:
     nombre = 'Publicador' if action == 'FIRST_PUBLISH' else 'Creador'
     query = f"""
         SELECT
-            CASE WHEN LOWER(e.email_editor) = 'infobae' THEN 'Infobae (agencias)'
-                 ELSE COALESCE(a.complete_name, e.email_editor) END as nombre,
+            COALESCE(a.complete_name, e.email_editor) as nombre,
             a.country as pais,
             COUNT(DISTINCT e.note_id) as notas
         FROM `{TABLE_EDITORIAL}` e
@@ -209,6 +223,7 @@ def _top_authors(client, start, end, action, limit=10) -> list:
         WHERE e.action_type = '{action}'
           AND DATE(e.event_timestamp) BETWEEN '{start}' AND '{end}'
           AND e.email_editor IS NOT NULL AND e.email_editor != ''
+          {SIN_AGENCIAS_ED}
         GROUP BY nombre, pais
         ORDER BY notas DESC
         LIMIT {limit}
@@ -221,12 +236,13 @@ def _top_authors(client, start, end, action, limit=10) -> list:
 def _sections(client, start, end) -> list:
     query = f"""
         WITH editorial_stats AS (
-            SELECT ed.segment as seccion, COUNT(DISTINCT ed.note_id) as notas
-            FROM `{TABLE_EDITORIAL}` ed
-            WHERE ed.action_type = 'FIRST_PUBLISH'
-              AND DATE(ed.event_timestamp) BETWEEN '{start}' AND '{end}'
-              AND ed.segment IS NOT NULL AND ed.segment != ''
-            GROUP BY ed.segment
+            SELECT e.segment as seccion, COUNT(DISTINCT e.note_id) as notas
+            FROM `{TABLE_EDITORIAL}` e
+            WHERE e.action_type = 'FIRST_PUBLISH'
+              AND DATE(e.event_timestamp) BETWEEN '{start}' AND '{end}'
+              AND e.segment IS NOT NULL AND e.segment != ''
+              {SIN_AGENCIAS_ED}
+            GROUP BY e.segment
         ),
         traffic_stats AS (
             SELECT g.section as seccion, SUM(g.visits) as sesiones
@@ -234,6 +250,7 @@ def _sections(client, start, end) -> list:
             WHERE g.date BETWEEN '{start}' AND '{end}'
               AND DATE(g.publish_date) BETWEEN '{start}' AND '{end}'
               AND g.section IS NOT NULL AND g.section != ''
+              {SIN_AGENCIAS_GOLD}
             GROUP BY g.section
         )
         SELECT e.seccion, e.notas, COALESCE(t.sesiones, 0) as sesiones,
@@ -259,6 +276,7 @@ def _section_country(client, start, end) -> list:
         WHERE e.action_type = 'FIRST_PUBLISH'
           AND DATE(e.event_timestamp) BETWEEN '{start}' AND '{end}'
           AND e.segment IS NOT NULL AND e.segment != ''
+          {SIN_AGENCIAS_ED}
         GROUP BY seccion, pais
     """
     df = _df(client, query)
@@ -277,6 +295,7 @@ def _countries_production(client, start, end) -> list:
         WHERE e.action_type IN ('CREATE', 'FIRST_PUBLISH')
           AND DATE(e.event_timestamp) BETWEEN '{start}' AND '{end}'
           AND a.country IS NOT NULL AND a.country != ''
+          {SIN_AGENCIAS_ED}
         GROUP BY pais
         ORDER BY notas DESC
     """
@@ -294,6 +313,7 @@ def _countries_traffic(client, start, end) -> dict:
         WHERE g.date BETWEEN '{start}' AND '{end}'
           AND DATE(g.publish_date) BETWEEN '{start}' AND '{end}'
           AND a.country IS NOT NULL AND a.country != ''
+          {SIN_AGENCIAS_GOLD}
         GROUP BY pais
     """
     query_hll = f"""

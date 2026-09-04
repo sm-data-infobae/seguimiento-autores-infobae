@@ -93,7 +93,7 @@ def kpi_card(label, value, delta="", highlight=False) -> str:
             f'<div class="kpi-delta">{delta}</div></div>')
 
 
-def hbar_rows(rows, note_label="notas") -> str:
+def hbar_rows(rows, unidad="notas") -> str:
     """rows: [{'label','flag','value','extra'}] -> barras horizontales estilo informe."""
     if not rows:
         return '<p class="muted">Sin datos para este período.</p>'
@@ -103,8 +103,10 @@ def hbar_rows(rows, note_label="notas") -> str:
         pct = max(2.0, r['value'] / max_v * 100)
         extra = f'<span class="hbar-extra">{r["extra"]}</span>' if r.get('extra') else ''
         fl = f'{r["flag"]} ' if r.get('flag') else ''
+        tooltip = f'{r["label"]} · {fmt_int(r["value"])} {unidad}'
         out.append(
-            f'<div class="hbar"><div class="hbar-label" title="{esc(r["label"])}">{fl}{esc(r["label"])}</div>'
+            f'<div class="hbar" data-label="{esc(tooltip)}">'
+            f'<div class="hbar-label" title="{esc(r["label"])}">{fl}{esc(r["label"])}</div>'
             f'<div class="hbar-track"><div class="hbar-fill" style="width:{pct:.1f}%"></div></div>'
             f'<div class="hbar-value">{fmt_big(r["value"])}</div>{extra}</div>')
     out.append('</div>')
@@ -138,6 +140,15 @@ def svg_line_chart(points, width=1060, height=260, color=ACCENT) -> str:
         ticks.append(f'<text x="{x(i):.0f}" y="{height - 10}" class="tick" text-anchor="middle">{int(d[8:10])}</text>')
     imax = vals.index(max(vals))
 
+    # Columnas invisibles por día: alimentan el tooltip de hover (JS del documento)
+    hits = []
+    half = iw / (n - 1) / 2
+    for i, (d, v) in enumerate(points):
+        x0 = max(pad_l, x(i) - half)
+        x1 = min(pad_l + iw, x(i) + half)
+        hits.append(f'<rect class="hit" x="{x0:.1f}" y="{pad_t}" width="{x1 - x0:.1f}" height="{ih}" '
+                    f'data-label="{esc(fecha_es(d))} · {fmt_int(v)}"/>')
+
     return f"""
     <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto" xmlns="http://www.w3.org/2000/svg" role="img">
       <defs><linearGradient id="area{abs(hash(line)) % 9999}" x1="0" y1="0" x2="0" y2="1">
@@ -154,6 +165,7 @@ def svg_line_chart(points, width=1060, height=260, color=ACCENT) -> str:
       <circle cx="{x(imax):.1f}" cy="{y(vals[imax]):.1f}" r="4" fill="{color}"/>
       <text x="{x(imax):.0f}" y="{y(vals[imax]) - 10:.0f}" class="tick" style="fill:{TEXT2}" text-anchor="middle">{fmt_big(vals[imax])}</text>
       {"".join(ticks)}
+      {"".join(hits)}
     </svg>"""
 
 
@@ -294,7 +306,9 @@ def render_brief_html(data: dict) -> str:
                  font-size:.8rem; line-height:1.5; }}
   .panel-foot b {{ color:{TEXT2}; }}
   .kpi-grid {{ display:grid; grid-template-columns:repeat(5, 1fr); gap:14px; margin:26px 0; }}
-  .kpi {{ background:{PANEL}; border:1px solid {BORDER}; border-radius:12px; padding:16px 18px; }}
+  .kpi {{ background:{PANEL}; border:1px solid {BORDER}; border-radius:12px; padding:16px 18px;
+          transition:border-color .15s ease, transform .15s ease; }}
+  .kpi:hover {{ border-color:#3E3E45; transform:translateY(-2px); }}
   .kpi.highlight {{ border-color:{ACCENT}; background:linear-gradient(160deg, {PANEL2}, #201709); }}
   .kpi-label {{ color:{TEXT2}; font-size:.78rem; margin-bottom:8px; }}
   .kpi-value {{ font-size:1.7rem; font-weight:800; letter-spacing:-.01em; }}
@@ -308,7 +322,16 @@ def render_brief_html(data: dict) -> str:
   .hbar-fill {{ background:linear-gradient(90deg, #b35f0e, {ACCENT}); height:100%; border-radius:4px; }}
   .hbar-value {{ font-weight:700; font-size:.88rem; text-align:right; }}
   .hbar-extra {{ font-size:.78rem; white-space:nowrap; }}
+  .hbar:hover .hbar-fill {{ filter:brightness(1.3); }}
+  .hbar:hover .hbar-label {{ color:{TEXT}; }}
   .tick {{ fill:{MUTED}; font-size:11px; font-family:inherit; }}
+  .hit {{ fill:transparent; }}
+  .hit:hover {{ fill:rgba(246,142,30,0.10); }}
+  .cross-bar div {{ transition:filter .1s ease; }}
+  .cross-bar div:hover {{ filter:brightness(1.35); }}
+  #tip {{ position:fixed; display:none; background:{PANEL2}; border:1px solid {BORDER}; color:{TEXT};
+          border-radius:8px; padding:7px 12px; font-size:.82rem; pointer-events:none; z-index:20;
+          box-shadow:0 6px 18px rgba(0,0,0,.5); white-space:nowrap; }}
   .country-grid {{ display:grid; grid-template-columns:repeat(3, 1fr); gap:16px; }}
   .country {{ background:{PANEL}; border:1px solid {BORDER}; border-radius:14px; padding:22px; }}
   .country h4 {{ font-size:1.05rem; margin-bottom:2px; }}
@@ -346,7 +369,7 @@ def render_brief_html(data: dict) -> str:
 
   <div class="hero">
     <div class="hero-num">{fmt_int(p['notas'])}</div>
-    <div class="hero-side">notas publicadas en {esc(mes_corto)}<br>{hero_delta}</div>
+    <div class="hero-side">notas publicadas por la redacción en {esc(mes_corto)}, sin agencias<br>{hero_delta}</div>
   </div>
   <div class="hero" style="margin-top:10px">
     <div class="hero-num" style="font-size:clamp(2rem,5vw,3.4rem); color:{TEXT}">{fmt_big(t['usuarios_unicos'])}</div>
@@ -358,7 +381,8 @@ def render_brief_html(data: dict) -> str:
   <div class="scroll-hint">Scrolleá para empezar</div>
 
   {chapter_header("01", "El pulso del mes", "Producción y alcance de la redacción",
-                  "toda la producción publicada en el mes, todos los países y secciones juntos.")}
+                  "la producción de la redacción en el mes, todos los países y secciones juntos. "
+                  "Las notas de agencias quedan afuera de todo el informe salvo el capítulo 05.")}
   <div class="kpi-grid">{"".join(kpis)}</div>
   <div class="panel">
     <h3>Notas publicadas día por día</h3>
@@ -405,19 +429,35 @@ def render_brief_html(data: dict) -> str:
     <div class="method">
       <b>Brief de Autores · {esc(label)} (mes completo), comparado contra {esc(prev_label)} completo.</b><br><br>
       La producción sale de la actividad editorial de ARC (creadores = evento CREATE; publicadores y notas =
-      FIRST_PUBLISH). El tráfico sale de GA4 y cubre únicamente las notas publicadas dentro del mes: el tráfico
-      a notas de meses anteriores no se incluye. {esc(metodo_nota)} El país del autor viene de la tabla de autores
-      de Infobae, matcheada por email; los autores sin fila en esa tabla no aparecen en el capítulo 04.
-      Elaborado automáticamente por el Centro de Control Editorial.
+      FIRST_PUBLISH). Las notas de agencias (usuario "infobae": EFE, EuropaPress, Narrativa, etc.) quedan
+      afuera de todos los números —producción, tráfico y tiempo de lectura incluidos— salvo del capítulo 05,
+      que las compara contra Composer y Scribnews. El tráfico sale de GA4 y cubre únicamente las notas
+      publicadas dentro del mes: el tráfico a notas de meses anteriores no se incluye. {esc(metodo_nota)}
+      El país del autor viene de la tabla de autores de Infobae, matcheada por email; los autores sin fila
+      en esa tabla no aparecen en el capítulo 04. Elaborado automáticamente por el Centro de Control Editorial.
     </div>
   </div>
 </div>
+<div id="tip"></div>
 <script>
   addEventListener('scroll', () => {{
     const h = document.documentElement;
     document.getElementById('progress').style.width =
       (h.scrollTop / (h.scrollHeight - h.clientHeight) * 100) + '%';
   }}, {{passive: true}});
+
+  // Tooltip de hover: cualquier elemento con data-label lo muestra junto al cursor
+  const tip = document.getElementById('tip');
+  document.querySelectorAll('[data-label]').forEach(el => {{
+    el.addEventListener('mousemove', e => {{
+      tip.textContent = el.dataset.label;
+      tip.style.display = 'block';
+      const w = tip.offsetWidth;
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - w - 8) + 'px';
+      tip.style.top = (e.clientY - 34) + 'px';
+    }});
+    el.addEventListener('mouseleave', () => {{ tip.style.display = 'none'; }});
+  }});
 </script>
 </body></html>"""
 
@@ -443,11 +483,13 @@ def _resumen_cards(data, prev_corto) -> str:
     top_country = countries[0]['pais'].title() if countries else "—"
     composer = sources.get('Composer', {}).get('notas', 0)
     scribnews = sources.get('Scribnews', {}).get('notas', 0)
-    unicos_txt = "usuarios únicos reales" if hll else "de alcance (suma diaria)"
+    agencias = sources.get('Agencias', {}).get('notas', 0)
+    unicos_txt = "usuarios únicos" if hll else "de alcance (suma diaria)"
 
     cards = [
         ("01 · PRODUCCIÓN",
-         f"Se publicaron <b>{fmt_int(p['notas'])} notas</b> ({frase_delta(p['notas'], pp['notas'])})."),
+         f"La redacción publicó <b>{fmt_int(p['notas'])} notas</b> ({frase_delta(p['notas'], pp['notas'])}), "
+         f"sin contar agencias."),
         ("02 · AUTORES",
          f"<b>{fmt_int(p['creadores'])} creadores</b> y <b>{fmt_int(p['publicadores'])} publicadores</b> "
          f"estuvieron activos ({frase_delta(p['creadores'], pp['creadores'])} en creadores)."),
@@ -461,8 +503,9 @@ def _resumen_cards(data, prev_corto) -> str:
          f"<b>{esc(top_sec_notas)}</b> fue la sección con más notas; "
          f"<b>{esc(top_sec_traf)}</b>, la de más tráfico."),
         ("06 · ORIGEN",
-         f"<b>{top_country}</b> fue la redacción con más notas. Por fuente: "
-         f"<b>{fmt_int(composer)}</b> por Composer y <b>{fmt_int(scribnews)}</b> por Scribnews."),
+         f"<b>{top_country}</b> fue la redacción con más notas: <b>{fmt_int(composer)}</b> por Composer y "
+         f"<b>{fmt_int(scribnews)}</b> por Scribnews. Las agencias sumaron <b>{fmt_int(agencias)}</b> notas "
+         f"automáticas, fuera del resto del informe."),
     ]
     return "".join(f'<div class="card6"><div class="n">{n}</div><p>{txt}</p></div>' for n, txt in cards)
 
@@ -487,13 +530,13 @@ def _cross_sections(data) -> str:
             share = r['notas'] / total * 100
             color = CROSS_COLORS[min(i, len(CROSS_COLORS) - 1)]
             segs.append(f'<div style="width:{share:.2f}%;background:{color}" '
-                        f'title="{esc(r["pais"])}: {fmt_int(r["notas"])} notas"></div>')
+                        f'data-label="{esc(str(r["pais"]).title())} · {fmt_int(r["notas"])} notas ({fmt_dec(share)} %)"></div>')
             if i < 3:
                 leg.append(f'<b>{esc(str(r["pais"]).title())}</b> {fmt_dec(share)} %')
         resto = total - sum(r['notas'] for r in rows[:5])
         if resto > 0:
             segs.append(f'<div style="width:{resto / total * 100:.2f}%;background:{CROSS_COLORS[-1]}" '
-                        f'title="Otros: {fmt_int(resto)} notas"></div>')
+                        f'data-label="Otros · {fmt_int(resto)} notas"></div>')
         out.append(f'<div class="cross-row"><div class="name">{esc(sec)} · {fmt_int(total)} notas</div>'
                    f'<div class="cross-bar">{"".join(segs)}</div>'
                    f'<div class="cross-leg">{" · ".join(leg)}</div></div>')
@@ -544,5 +587,5 @@ def _sources_block(data, prev_corto) -> str:
             f'<div class="panel"><h3>Notas publicadas por fuente</h3>'
             f'<div class="sub">La variación contra {esc(prev_corto)} está a la derecha.</div>{hbar_rows(rows_notas)}</div>'
             f'<div class="panel"><h3>Visitas por fuente</h3>'
-            f'<div class="sub">Con la eficiencia (sesiones por nota) a la derecha.</div>{hbar_rows(rows_ses)}</div>'
+            f'<div class="sub">Con la eficiencia (sesiones por nota) a la derecha.</div>{hbar_rows(rows_ses, unidad="sesiones")}</div>'
             f'</div>')
