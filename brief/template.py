@@ -22,6 +22,8 @@ ACCENT = "#F68E1E"
 UP = "#0CA30C"
 DOWN = "#D03B3B"
 
+TABLERO_URL = "https://seguimiento-autores-infobae.streamlit.app/"
+
 PAIS_FLAGS = {
     'ARGENTINA': '🇦🇷', 'COLOMBIA': '🇨🇴', 'PERU': '🇵🇪', 'ESPAÑA': '🇪🇸',
     'MEXICO': '🇲🇽', 'AMERICA': '🌎', 'CENTROAMERICA': '🌎', 'COLABORADOR': '✍️',
@@ -197,7 +199,13 @@ def fecha_es_semana(iso) -> str:
 
 # ─────────────────────────────── documento ───────────────────────────────
 
-def render_brief_html(data: dict) -> str:
+def render_brief_html(data: dict, con_volver: bool = False) -> str:
+    """
+    con_volver=True agrega un botón fijo "← Volver al tablero" arriba a la
+    derecha: es para la versión embebida en Streamlit, donde el sidebar puede
+    estar colapsado y la vuelta al tablero quedaba perdida. La versión que se
+    descarga va sin el botón (el link al tablero ya está en el cierre).
+    """
     label = data['label']            # "Julio 2026"
     prev_label = data['prev_label']  # "Junio 2026"
     mes_corto = label.split()[0].lower()        # "julio"
@@ -272,6 +280,9 @@ def render_brief_html(data: dict) -> str:
     # ── 05 · Fuentes ──
     sources_html = _sources_block(data, prev_corto)
 
+    volver_btn = (f'<a class="volver" href="{TABLERO_URL}" target="_top">← Volver al tablero</a>'
+                  if con_volver else '')
+
     metodo_nota = ("Usuarios y sesiones únicas se calculan con sketches HLL (cada lector cuenta una sola vez en el mes)."
                    if hll else
                    "Este mes no tiene cobertura completa de sketches HLL: usuarios y sesiones son la suma de únicos "
@@ -286,6 +297,10 @@ def render_brief_html(data: dict) -> str:
   body {{ background:{BG}; color:{TEXT}; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
          -webkit-font-smoothing:antialiased; }}
   .progress {{ position:fixed; top:0; left:0; height:3px; background:{ACCENT}; width:0; z-index:10; }}
+  .volver {{ position:fixed; top:14px; right:16px; z-index:15; background:{PANEL2}; border:1px solid {BORDER};
+             color:{TEXT2}; text-decoration:none; font-size:.82rem; font-weight:600; padding:8px 16px;
+             border-radius:999px; transition:border-color .15s ease, color .15s ease; }}
+  .volver:hover {{ border-color:{ACCENT}; color:{ACCENT}; }}
   /* Columna líquida: en monitores grandes se estira hasta 1500px en vez de dejar
      márgenes muertos; en chicos ocupa todo el ancho. */
   .wrap {{ max-width:clamp(1100px, 82vw, 1500px); margin:0 auto; padding:0 48px 80px; }}
@@ -379,6 +394,7 @@ def render_brief_html(data: dict) -> str:
   }}
 </style></head><body>
 <div class="progress" id="progress"></div>
+{volver_btn}
 <div class="wrap">
 
   <div class="logo">infobae</div>
@@ -443,7 +459,7 @@ def render_brief_html(data: dict) -> str:
     <h2>Con qué seguir</h2>
     <p>Todo lo que ves acá sale del tablero de Seguimiento de Autores, que sigue vivo y actualizado a diario.
        Si necesitás filtrar por autor, sección o país, o mirar otro rango de fechas, entrá directo:</p>
-    <p><a href="https://seguimiento-autores-infobae.streamlit.app/" target="_blank">Abrir el tablero completo →</a></p>
+    <p><a href="{TABLERO_URL}" target="_blank">Abrir el tablero completo →</a></p>
     <div class="method">
       <b>Brief de Autores · {esc(label)} (mes completo), comparado contra {esc(prev_label)} completo.</b><br><br>
       La producción sale de la actividad editorial de ARC (creadores = evento CREATE; publicadores y notas =
@@ -538,18 +554,32 @@ def _resumen_cards(data, prev_corto) -> str:
     return "".join(f'<div class="card6"><div class="n">{n}</div><p>{txt}</p></div>' for n, txt in cards)
 
 
-CROSS_COLORS = ["#F68E1E", "#c96f10", "#8f5511", "#5c3a10", "#3a2a12", "#26262A"]
+CROSS_COLORS = ["#F68E1E", "#FFC983", "#A85F10", "#63431A", "#3A2A12", "#26262A"]
+
+# Umbrales de "sección cross": si una sola redacción tiene más del 85 % de las
+# notas (las ediciones por país rondan el 100 %), la barra sale de un solo color
+# y no informa nada. Solo entran secciones con volumen mínimo.
+CROSS_MAX_DOMINANTE = 0.85
+CROSS_MIN_NOTAS = 100
 
 
 def _cross_sections(data) -> str:
-    """Para las secciones top: qué redacción (país) puso las notas."""
+    """Secciones cross: dónde más de una redacción le está pegando al mismo tema."""
     by_sec = {}
     for row in data['section_country']:
         by_sec.setdefault(row['seccion'], []).append(row)
-    top_secs = [s['seccion'] for s in data['sections'][:6]]
-    out = ['<div class="panel"><h3>¿Qué redacción empujó cada sección?</h3>'
-           '<div class="sub">Reparto de las notas publicadas por país del autor, en las 6 secciones con más '
-           'notas. Sirve para ver secciones cross: quién le está pegando al tema.</div><div class="cross">']
+    candidatas = []
+    for sec, rows in by_sec.items():
+        total = sum(r['notas'] for r in rows)
+        if total >= CROSS_MIN_NOTAS and max(r['notas'] for r in rows) / total <= CROSS_MAX_DOMINANTE:
+            candidatas.append((sec, total))
+    top_secs = [s for s, _ in sorted(candidatas, key=lambda t: -t[1])[:8]]
+    if not top_secs:
+        return ''
+    out = ['<div class="panel"><h3>¿Qué redacción empujó cada sección cross?</h3>'
+           '<div class="sub">Solo las secciones donde ninguna redacción pasa del 85 % de las notas — ahí se ve '
+           'quién le está pegando al tema. Las ediciones por país (~100 % de su propia redacción) quedan '
+           'afuera porque no informan nada.</div><div class="cross">']
     for sec in top_secs:
         rows = sorted(by_sec.get(sec, []), key=lambda r: -r['notas'])
         total = sum(r['notas'] for r in rows) or 1

@@ -59,7 +59,10 @@ with st.sidebar:
 year, month = seleccion
 with st.spinner(f"Generando el brief de {month_label(year, month)}… (la primera vez tarda un rato)"):
     data = load_brief_data(client, year, month)
+    # La versión embebida lleva el botón fijo "Volver al tablero" (el sidebar
+    # puede estar colapsado); la descargable va limpia.
     html = render_brief_html(data)
+    html_embed = render_brief_html(data, con_volver=True)
 
 with st.sidebar:
     st.download_button(
@@ -82,4 +85,4 @@ with st.sidebar:
             pass
 
 # La altura real la fija el CSS de arriba (100vh); este valor es solo el fallback.
-components.html(html, height=900, scrolling=True)
+components.html(html_embed, height=900, scrolling=True)
